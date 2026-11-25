@@ -1,0 +1,16 @@
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Data: block everything except the compact deploy DB
+data/*
+!data/deploy_model.duckdb
+data/deploy_model.duckdb.tmp
+data/*.wal
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/

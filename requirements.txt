@@ -1,0 +1,16 @@
+# Runtime dependencies for Streamlit Community Cloud (pinned to the versions tested locally).
+# Dev/test-only tools (pytest, pytest-asyncio) live in pyproject.toml [project.optional-dependencies].
+streamlit==1.67.0
+plotly==7.1.0
+duckdb==2.0.1
+pandas==3.1.1
+numpy==2.4.6
+pyarrow==26.0.1
+polars==2.1.0
+scipy==1.17.1
+lightgbm==4.7.0
+rapidfuzz==3.14.6
+httpx==0.28.1
+pydantic==2.14.4
+python-dotenv==1.2.4
+nflreadpy==0.1.5
