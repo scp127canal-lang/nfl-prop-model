@@ -87,6 +87,21 @@ def _rosters(season):
     })
 
 
+def _depth_charts(season):
+    if season >= 2025:   # daily ESPN snapshots, WRs listed per slot
+        return pl.DataFrame({
+            "dt": ["2025-11-20T06:00:00Z"] * 5 + ["2025-11-27T06:00:00Z"] * 3,
+            "team": ["DET"] * 8, "player_name": ["Jared Goff", "Backup QB", "Amon-Ra St. Brown", "WR Slot", "LT Guy",
+                                                 "Backup QB", "Jared Goff", "Amon-Ra St. Brown"],
+            "gsis_id": ["00-0001", "00-0009", "00-0002", "00-0008", "00-0007", "00-0009", "00-0001", "00-0002"],
+            "pos_abb": ["QB", "QB", "WR", "WR", "LT", "QB", "QB", "WR"],
+            "pos_slot": [1, 1, 8, 1, 3, 1, 1, 8], "pos_rank": [1, 2, 1, 1, 1, 1, 2, 1],
+        })
+    return pl.DataFrame({"season": [season] * 3, "week": [1, 1, 1], "club_code": ["DET", "DET", "GB"],
+                         "gsis_id": ["00-0001", "00-0002", "00-0003"], "position": ["QB", "WR", "QB"],
+                         "depth_team": ["1", "1", "1"], "full_name": ["Jared Goff", "Amon-Ra St. Brown", "Jordan Love"]})
+
+
 def _participation(season):
     if season >= 2026:
         raise ValueError("Season must be between 2016 and 2025")
@@ -116,6 +131,7 @@ class FakeLoaders(dict):
             "snap_counts": wrap("snap_counts", _snap_counts),
             "injuries": wrap("injuries", _injuries),
             "rosters": wrap("rosters", _rosters),
+            "depth_charts": wrap("depth_charts", _depth_charts),
             "participation": wrap("participation", _participation),
         })
 
@@ -396,3 +412,22 @@ def test_season_week_forced_to_integer(con):
     loaders["injuries"] = lambda s: _injuries(s).with_columns(pl.col("season").cast(pl.Float64))
     nd.ingest(con, [2024], datasets=["injuries"], loaders=loaders)
     assert _q(con, "SELECT DISTINCT typeof(season) FROM injuries") == [("INTEGER",)]
+
+
+def test_clean_depth_charts_both_schemas():
+    new = nd.clean_depth_charts(_depth_charts(2025), 2025)
+    assert set(new["position"]) == {"QB", "WR"}                      # offensive line dropped
+    last = new.filter(pl.col("snapshot_date") == date(2025, 11, 27)).sort("position", "depth_rank")
+    assert last.select("gsis_id", "depth_rank").rows() == [("00-0009", 1), ("00-0001", 2), ("00-0002", 1)]
+    first = new.filter((pl.col("snapshot_date") == date(2025, 11, 20)) & (pl.col("position") == "WR"))
+    # both WRs are rank 1 of their slot: the team rank breaks the tie on slot number
+    assert first.sort("depth_rank")["gsis_id"].to_list() == ["00-0008", "00-0002"]
+    old = nd.clean_depth_charts(_depth_charts(2024), 2024)
+    assert old.columns == new.columns and old["depth_rank"].to_list() == [1, 1, 1]
+    assert old["team"].to_list() == ["DET", "DET", "GB"] and old["snapshot_date"].is_null().all()
+
+
+def test_ingest_writes_depth_charts(con):
+    nd.ingest(con, [2024, 2025], loaders=FakeLoaders())
+    rows = _q(con, "SELECT season, COUNT(*) FROM depth_charts GROUP BY 1 ORDER BY 1")
+    assert rows == [(2024, 3), (2025, 7)]                  # 8 rows minus the LT

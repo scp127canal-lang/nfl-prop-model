@@ -24,7 +24,8 @@ FONT = "Inter, Segoe UI, system-ui, sans-serif"
 
 CSS = f"""
 <style>
-.block-container {{ padding-top: 1.6rem; padding-bottom: 2rem; }}
+/* clear Streamlit's fixed header so it never clips the tabs (mobile + desktop) */
+.block-container {{ padding-top: 3.5rem !important; padding-bottom: 2rem; }}
 [data-testid="stMetricValue"] {{ font-size: 1.45rem; }}
 [data-testid="stMetricLabel"] p {{ color: {TEXT_2}; }}
 .small-note {{ color: {TEXT_2}; font-size: 0.85rem; }}
@@ -67,6 +68,35 @@ def kpi_row(items: Sequence[tuple[str, str, str | None]]) -> None:
 
 
 # ======================================================================================
+# Weather badge
+# ======================================================================================
+HIGH_WIND_MPH = 15.0
+
+
+def weather_label(weather: dict | None) -> tuple[str, str, bool]:
+    """(text, badge color, high-wind alert) for a ``weather_client`` dict (None = not fetched)."""
+    if weather is None:
+        return "🌤️ Outdoor: forecast not loaded — click Re-run Match Simulations", "gray", False
+    if weather.get("is_dome"):
+        return "🏟️ Dome (Controlled)", "blue", False
+    if weather.get("available") is False:
+        return f"☁️ {weather.get('summary', 'No forecast')} · no weather adjustment", "gray", False
+    wind = float(weather.get("wind_mph") or 0.0)
+    temp = weather.get("temp_f")
+    text = (f"🌬️ Outdoor: {temp:.0f}°F | Wind: {wind:.0f} mph | Precip: {int(weather.get('precip_prob') or 0)}%"
+            if temp is not None else f"🌬️ {weather.get('summary', '')}")
+    high = wind > HIGH_WIND_MPH
+    return (text + " · high wind" if high else text), ("red" if high else "green"), high
+
+
+def weather_badge(weather: dict | None, where=None) -> None:
+    """Compact forecast badge; wind above 15 mph is flagged red with a warning icon."""
+    where = where or st
+    text, color, high = weather_label(weather)
+    where.badge(text, icon=":material/warning:" if high else None, color=color)
+
+
+# ======================================================================================
 # Scanner
 # ======================================================================================
 SCANNER_COLUMN_CONFIG = {
@@ -92,6 +122,13 @@ def edge_table(df: pd.DataFrame, key: str) -> None:
 # ======================================================================================
 # Player sim histogram
 # ======================================================================================
+# Horizontal legend centred under the plot + roomy margins, so on a narrow (portrait phone)
+# screen the legend never overlaps the title or the "mean" annotation.
+PLAYER_SIM_LEGEND = dict(
+    legend=dict(orientation="h", yanchor="top", y=-0.22, xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)"),
+    margin=dict(l=56, r=24, t=60, b=90))
+
+
 def sim_histogram(x: np.ndarray, lines: pd.DataFrame, stat_label: str, player: str,
                   highlight_line: float | None = None) -> go.Figure:
     """Histogram of simulated outcomes with a vertical line per (book, line)."""
@@ -128,7 +165,8 @@ def sim_histogram(x: np.ndarray, lines: pd.DataFrame, stat_label: str, player: s
             include_groups=False)
         fig.add_scatter(x=agg.index, y=[0] * len(agg), mode="markers", marker=dict(size=12, color="rgba(0,0,0,0)"),
                         hovertext=agg.values, hovertemplate="line %{x}<br>%{hovertext}<extra></extra>", showlegend=False)
-    base_layout(fig, f"{player} — {stat_label}: {len(x):,} simulated games", height=440, bargap=0.05)
+    base_layout(fig, f"{player} — {stat_label}: {len(x):,} simulated games", height=460, bargap=0.05)
+    fig.update_layout(**PLAYER_SIM_LEGEND)
     fig.update_xaxes(title=stat_label)
     fig.update_yaxes(title="Probability", tickformat=".0%")
     return fig

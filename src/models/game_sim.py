@@ -26,6 +26,26 @@
      TDs to rushers by carries x red-zone factor. QB lines are the sums over his receivers
      (completions = sum of receptions, pass yards = sum of receiving yards).
 
+Depth-chart mode (``simulate_game(..., depth={...})``, used by the dashboard): the user's
+inactive list, explicit re-activations and starting-QB picks are turned into overrides
+(``depth_overrides``) and :func:`apply_usage_overrides` then
+
+* zeroes every inactive player and hands his target / carry share to active teammates in
+  proportion to their share (same position group weighted 2x; carries only to RB/FB);
+* promotes a replacement QB when the starter is out (depth chart, then snap share) or the user
+  picked one. A QB who is not the team's established QB1 throws with ``qb_efficiency`` (default
+  0.85x yards per attempt, split as ``catch_rate x f^0.4`` and ``ypr x f^0.6``);
+* lowers the team's passing efficiency by ``MISSING_STARTER_PENALTY`` (13.5%) per 0.25 of target
+  share of missing WR1 / WR2 / TE1, the same way.
+
+Weather (``simulate_game(..., weather={...})``, from ``src.ingestion.weather_client``), both teams:
+
+* wind above ``WIND_THRESHOLD_MPH`` (15): passing efficiency -1.2% and pass rate -0.8% (relative)
+  per mph over the threshold; the lost dropbacks become designed runs (carries = plays - dropbacks);
+* precipitation probability >= 50% or temperature < 25°F: a further -3% passing efficiency each
+  (-5% when both), weighted toward yards per reception (deep balls) rather than catch rate.
+Domes / unavailable forecasts change nothing.
+
 ``simulate_game(game_id, usage_overrides=None)`` returns a ``SimResult`` holding the full trial
 arrays, so any line (Over X.5, alt X+) is priced with ``prob_over`` / ``prob_at_least``.
 
@@ -76,6 +96,26 @@ PRIOR = {  # position priors for shrinkage: (value, pseudo-count)
     "int_rate": (0.0225, 200),
 }
 OTHER_PARAMS = {"catch_rate": 0.65, "ypr": 10.0}
+ROSTER_ONLY_RESIDUAL_FRACTION = 0.8   # roster-only backups share at most 80% of the unassigned volume
+ROSTER_ONLY_MIN_ROOM = 0.04           # ... but always at least this much per team (never a hard zero)
+BACKUP_QB_EFFICIENCY = 0.85           # yards-per-attempt multiplier for a non-QB1 starter
+MISSING_STARTER_PENALTY = 0.135       # passing efficiency loss per 0.25 target share of missing WR1/WR2/TE1
+MISSING_STARTER_UNIT = 0.25
+MIN_PASS_EFFICIENCY = 0.6
+YPA_CATCH_EXPONENT = 0.4              # f = catch-rate part x yards-per-reception part
+REDISTRIBUTE_FLOOR = 0.01             # every active teammate gets a little of a vacated share
+SAME_GROUP_WEIGHT = 2.0
+QB_STARTER_CARRY_PRIOR = 0.08
+QB1_MIN_QUAL_GAMES = 3
+WIND_THRESHOLD_MPH = 15.0
+WIND_PASS_EFF_PER_MPH = 0.012
+WIND_PASS_RATE_PER_MPH = 0.008
+WIND_MAX_EXCESS_MPH = 25.0            # cap: 40 mph winds don't extrapolate linearly forever
+PRECIP_PROB_THRESHOLD = 50
+COLD_TEMP_F = 25.0
+WET_OR_COLD_PENALTY = 0.03            # one condition
+WET_AND_COLD_PENALTY = 0.05           # both
+WEATHER_CATCH_EXPONENT = 0.25         # precip/cold hit yards per catch (deep passing) harder
 
 # Odds API market key -> SimResult stat name
 MARKET_STATS = {
@@ -293,13 +333,16 @@ class TeamParams:
     int_rate: float
     pass_td_share: float
     sd_points: float | None = None   # target outcome SD of team points; None -> Poisson scoring
+    qb_attempt_share: float = 1.0    # share of the team's passing credited to the starting QB
 
 
 def load_players(con: duckdb.DuckDBPyConnection, game_id: str) -> pd.DataFrame:
     """Active skill players for a game with shares and shrunk efficiency (all as-of game date)."""
     have = {r[0] for r in con.execute("DESCRIBE player_features").fetchall()}
     opt = {"qual_games": "NULL::INTEGER", "target_share_prior": "NULL::DOUBLE", "carry_share_prior": "NULL::DOUBLE",
-           "snap_share_expected": "NULL::DOUBLE"}
+           "snap_share_expected": "NULL::DOUBLE", "roster_only": "FALSE", "roster_status": "NULL::VARCHAR",
+           "depth_rank": "NULL::DOUBLE", "target_share_ewm3": "NULL::DOUBLE", "target_share_ewm5": "NULL::DOUBLE",
+           "carry_share_ewm3": "NULL::DOUBLE", "carry_share_ewm5": "NULL::DOUBLE"}
     extra = ", ".join(f"{c if c in have else d} AS {c}" for c, d in opt.items())
     pf = con.execute(f"""
         SELECT gsis_id, player_name, team, position, game_date, is_out, injury_status,
@@ -334,15 +377,25 @@ def load_players(con: duckdb.DuckDBPyConnection, game_id: str) -> pd.DataFrame:
     df["target_share_own"] = df[["target_share_ewm3_adj", "target_share_ewm5_adj"]].mean(axis=1).fillna(0.0)
     df["carry_share_own"] = df[["carry_share_ewm3_adj", "carry_share_ewm5_adj"]].mean(axis=1).fillna(0.0)
     blend_cold_start(df)
+    # Usage if he plays, ignoring the injury spillover that zeroed an Out starter: lets the
+    # dashboard re-activate a listed player or promote a backup QB with a sensible share.
+    w_own = 1.0 - df["usage_prior_weight"]
+    for c in ("target_share", "carry_share"):
+        raw = df[[f"{c}_ewm3", f"{c}_ewm5"]].mean(axis=1)
+        own = raw.where(raw.notna(), df[f"{c}_own"]).fillna(0.0)
+        prior = pd.to_numeric(df[f"{c}_prior"], errors="coerce").fillna(0.0)
+        df[f"{c}_if_active"] = (w_own * own + (1 - w_own) * prior).where(df["usage_prior_weight"] > 0, own)
+    df["roster_only"] = df["roster_only"].fillna(False).astype(bool)
     df["active"] = ~df["is_out"].fillna(False).astype(bool)
-    # One starting QB per team: the healthy QB with the highest recent snap share.
+    # One starting QB per team: the healthy QB highest on the depth chart, then by recent snaps.
     df["is_starting_qb"] = False
     for team, g in df[(df["position"] == "QB") & df["active"]].groupby("team"):
-        df.loc[g.sort_values(["snap_share_ewm5", "prior_games"], ascending=False).index[0], "is_starting_qb"] = True
+        df.loc[_qb_order(g).index[0], "is_starting_qb"] = True
     backup_qb = (df["position"] == "QB") & ~df["is_starting_qb"]
     df.loc[backup_qb, ["target_share", "carry_share"]] = 0.0
     df.loc[backup_qb, "active"] = False
     df.loc[~df["active"], ["target_share", "carry_share"]] = 0.0
+    _cap_roster_only(df)
     for team in df["team"].unique():
         for col, cap in (("target_share", MAX_TEAM_TARGET_SHARE), ("carry_share", MAX_TEAM_CARRY_SHARE)):
             m = df["team"] == team
@@ -350,6 +403,30 @@ def load_players(con: duckdb.DuckDBPyConnection, game_id: str) -> pd.DataFrame:
             if tot > cap:
                 df.loc[m, col] *= cap / tot
     return df.drop(columns=["tgt", "rec", "rec_yds", "car", "rush_yds", "att", "ints"]).reset_index(drop=True)
+
+
+def _qb_order(qbs: pd.DataFrame) -> pd.DataFrame:
+    """QBs ordered by depth-chart rank (unranked last), then recent snap share and experience."""
+    return qbs.assign(_dr=pd.to_numeric(qbs["depth_rank"], errors="coerce").fillna(99.0),
+                      _ss=qbs["snap_share_ewm5"].fillna(0.0)).sort_values(
+        ["_dr", "_ss", "prior_games"], ascending=[True, False, False]).drop(columns=["_dr", "_ss"])
+
+
+def _cap_roster_only(df: pd.DataFrame, frac: float = ROSTER_ONLY_RESIDUAL_FRACTION) -> None:
+    """Roster-only backups (no recent snaps) may only use part of the volume not assigned to the
+    established players (at least ``ROSTER_ONLY_MIN_ROOM``), so adding the full roster dilutes
+    the starters by a few percent at most (in place)."""
+    ro = df["roster_only"] & df["active"]
+    if not ro.any():
+        return
+    for team in df.loc[ro, "team"].unique():
+        m = df["team"] == team
+        for col, cap in (("target_share", MAX_TEAM_TARGET_SHARE), ("carry_share", MAX_TEAM_CARRY_SHARE)):
+            regular = df.loc[m & df["active"] & ~df["roster_only"], col].sum()
+            room = max(max(cap - regular, 0.0) * frac, ROSTER_ONLY_MIN_ROOM)
+            extra = df.loc[m & ro, col].sum()
+            if extra > room:
+                df.loc[m & ro, col] *= room / extra if extra > 0 else 0.0
 
 
 def _renormalize(df: pd.DataFrame, col: str, team: str, fixed: set[str], total: float,
@@ -389,22 +466,104 @@ def blend_cold_start(df: pd.DataFrame, min_games: int = COLD_START_GAMES) -> pd.
     return df
 
 
+def _redistribute(df: pd.DataFrame, team: str, vacated: Mapping[str, float], group: str | None) -> None:
+    """Hand vacated target / carry share to the team's active players (in place): in proportion
+    to their share (+ a small floor), same position group weighted ``SAME_GROUP_WEIGHT``x;
+    targets skip QBs, carries go to RB/FB when the team has any."""
+    m = (df["team"] == team) & df["active"]
+    pos = df["position"]
+    pgroup = pos.replace({"FB": "RB"})
+    for col, amount in vacated.items():
+        if amount <= 0:
+            continue
+        if col == "target_share":
+            rec = m & (pos != "QB")
+        else:
+            rec = m & pos.isin(["RB", "FB"])
+            rec = rec if rec.any() else m
+        if not rec.any():
+            continue
+        w = (df.loc[rec, col] + REDISTRIBUTE_FLOOR) * np.where(pgroup[rec] == group, SAME_GROUP_WEIGHT, 1.0)
+        df.loc[rec, col] += amount * w / w.sum()
+
+
+def _pass_efficiency(df: pd.DataFrame, team: str, factor: float, skip: set[str]) -> None:
+    """Scale the team's receiving efficiency so yards per attempt moves by ``factor`` (in place)."""
+    if abs(factor - 1.0) < 1e-9:
+        return
+    m = (df["team"] == team) & ~df["gsis_id"].isin(skip)
+    df.loc[m, "catch_rate"] = np.clip(df.loc[m, "catch_rate"] * factor ** YPA_CATCH_EXPONENT, 0.3, 0.95)
+    df.loc[m, "ypr"] = np.clip(df.loc[m, "ypr"] * factor ** (1 - YPA_CATCH_EXPONENT), 3.0, 25.0)
+
+
+def missing_starter_share(df: pd.DataFrame, team: str) -> tuple[float, list[str]]:
+    """Target share (pre-injury EWMA) of the team's WR1 / WR2 / TE1 who are not active."""
+    t = df[df["team"] == team]
+    usage = t[["target_share_ewm3", "target_share_ewm5"]].mean(axis=1).fillna(t["target_share_if_active"]).fillna(0.0)
+    t = t.assign(_u=usage)
+    starters = pd.concat([t[t["position"] == "WR"].nlargest(2, "_u"), t[t["position"] == "TE"].nlargest(1, "_u")])
+    starters = starters[starters["_u"] > 0]
+    gone = starters[~starters["active"]]
+    return float(gone["_u"].sum()), gone["player_name"].astype(str).tolist() if "player_name" in gone else []
+
+
+def team_qb1(df: pd.DataFrame, team: str) -> str | None:
+    """The team's established QB1: most recent snap share among QBs with enough qualifying games."""
+    q = df[(df["team"] == team) & (df["position"] == "QB")]
+    est = q[pd.to_numeric(q["qual_games"], errors="coerce").fillna(0) >= QB1_MIN_QUAL_GAMES]
+    pool = est if len(est) else q
+    if pool.empty:
+        return None
+    return str(pool.sort_values(["snap_share_ewm5", "prior_games"], ascending=False, na_position="last")
+               ["gsis_id"].iloc[0])
+
+
+def _set_starting_qb(df: pd.DataFrame, team: str, qb: str, fixed: dict[tuple[str, str], set[str]]) -> None:
+    m = (df["team"] == team) & (df["position"] == "QB")
+    old = df.index[m & df["is_starting_qb"]]
+    df.loc[old, ["target_share", "carry_share"]] = 0.0
+    df.loc[old, ["active", "is_starting_qb"]] = False
+    i = df.index[df["gsis_id"] == qb][0]
+    q = pd.to_numeric(pd.Series([df.at[i, "qual_games"]]), errors="coerce").fillna(0).iloc[0]
+    w = min(float(q) / COLD_START_GAMES, 1.0)
+    df.at[i, "carry_share"] = w * float(df.at[i, "carry_share_if_active"]) + (1 - w) * QB_STARTER_CARRY_PRIOR
+    df.at[i, "target_share"] = float(df.at[i, "target_share_if_active"]) * w
+    df.at[i, "active"] = True
+    df.at[i, "is_starting_qb"] = True
+    fixed[(team, "carry_share")].add(qb)
+    fixed[(team, "target_share")].add(qb)
+
+
 def apply_usage_overrides(players: pd.DataFrame, overrides: Mapping[str, Mapping[str, Any]] | None,
-                          teams: Sequence[str]) -> tuple[pd.DataFrame, dict[str, dict[str, float]]]:
+                          teams: Sequence[str], depth_adjust: bool = False
+                          ) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
     """Apply per-player (keyed by gsis_id) and per-team (keyed by team abbr) overrides.
 
-    Player keys: ``target_share``, ``carry_share``, ``catch_rate``, ``ypr``, ``ypc``, ``active``
-    (False removes him and hands his share to teammates unless ``redistribute=False``).
-    Team keys: ``points``, ``plays``, ``pass_rate``.
-    Teammates' shares are rescaled so each team's total share is unchanged.
+    Player keys: ``target_share``, ``carry_share``, ``catch_rate``, ``ypr``, ``ypc``, ``active``.
+    ``active=False`` zeroes him and hands his share to active teammates (``_redistribute``) unless
+    ``redistribute=False``; ``active=True`` brings back a listed-out player at his pre-injury usage.
+    Team keys: ``points``, ``plays``, ``pass_rate``, ``starting_qb`` (gsis_id), ``qb_efficiency``,
+    ``qb_attempt_share``.
+    Explicit shares are fixed and the rest of the team is rescaled so team totals are unchanged.
+
+    ``depth_adjust`` (dashboard depth mode) also auto-promotes a QB when the starter is out and
+    applies the backup-QB and missing-WR1/WR2/TE1 efficiency penalties. The second return value
+    holds team overrides plus, per team, ``_adjustments`` describing what was applied.
     """
     df = players.copy()
-    team_over: dict[str, dict[str, float]] = {}
-    if not overrides:
+    team_over: dict[str, dict[str, Any]] = {}
+    overrides = overrides or {}
+    if not overrides and not depth_adjust:
         return df, team_over
-    totals = {(t, c): df.loc[(df["team"] == t) & df["active"], c].sum() for t in teams
-              for c in ("target_share", "carry_share")}
-    fixed: dict[tuple[str, str], set[str]] = {k: set() for k in totals}
+    for c in ("target_share_if_active", "carry_share_if_active"):
+        if c not in df:
+            df[c] = df[c.removesuffix("_if_active")]
+    for c in ("target_share_ewm3", "target_share_ewm5", "depth_rank"):
+        if c not in df:
+            df[c] = np.nan
+    fixed: dict[tuple[str, str], set[str]] = {(t, c): set() for t in teams for c in ("target_share", "carry_share")}
+    explicit_eff: set[str] = set()
+    player_ov: dict[int, Mapping[str, Any]] = {}
     for key, ov in overrides.items():
         if key in teams:
             team_over[key] = dict(ov)
@@ -412,27 +571,176 @@ def apply_usage_overrides(players: pd.DataFrame, overrides: Mapping[str, Mapping
         idx = df.index[df["gsis_id"] == key]
         if len(idx) == 0:
             raise KeyError(f"usage_overrides: {key!r} is not an eligible player or team in this game")
-        i = idx[0]
-        team = df.at[i, "team"]
+        player_ov[idx[0]] = ov
+
+    # 1) inactive players: zero, then hand their volume to active teammates
+    vacated: dict[str, list[tuple[str, dict[str, float]]]] = {}
+    changed: dict[str, list[str]] = {t: [] for t in teams}
+    for i, ov in player_ov.items():
         if ov.get("active") is False:
+            team = df.at[i, "team"]
+            if df.at[i, "active"]:
+                changed.setdefault(team, []).append(str(df.at[i, "gsis_id"]))
+            shares = {c: float(df.at[i, c]) if df.at[i, "active"] else 0.0 for c in ("target_share", "carry_share")}
             df.loc[i, ["target_share", "carry_share"]] = 0.0
             df.at[i, "active"] = False
-            if not ov.get("redistribute", True):
-                for c in ("target_share", "carry_share"):
-                    totals[(team, c)] = df.loc[(df["team"] == team) & df["active"], c].sum()
-            continue
-        if ov.get("active") is True:
+            if "snap_share_ewm5" in df:
+                df.at[i, "snap_share_ewm5"] = 0.0
+            if df.at[i, "position"] == "QB" and df.at[i, "is_starting_qb"]:
+                df.at[i, "is_starting_qb"] = False
+                shares["target_share"] = 0.0          # a QB's volume goes to his replacement
+                shares["carry_share"] = 0.0
+            if ov.get("redistribute", True):
+                vacated.setdefault(team, []).append((df.at[i, "position"], shares))
+    for team, items in vacated.items():
+        for pos, shares in items:
+            _redistribute(df, team, shares, "RB" if pos == "FB" else pos)
+    totals = {(t, c): df.loc[(df["team"] == t) & df["active"], c].sum() for t in teams
+              for c in ("target_share", "carry_share")}
+
+    # 2) re-activated (listed-out) players come back at their pre-injury usage
+    for i, ov in player_ov.items():
+        if ov.get("active") is True and not df.at[i, "active"]:
+            team = df.at[i, "team"]
             df.at[i, "active"] = True
+            if df.at[i, "position"] != "QB":
+                changed.setdefault(team, []).append(str(df.at[i, "gsis_id"]))
+            if df.at[i, "position"] != "QB":
+                for c in ("target_share", "carry_share"):
+                    df.at[i, c] = float(df.at[i, f"{c}_if_active"])
+                    fixed[(team, c)].add(df.at[i, "gsis_id"])
+            else:
+                df.at[i, "active"] = False      # a QB only plays as the starter (below)
+                df.at[i, "is_out"] = False
+
+    # 3) starting QB: explicit pick, else auto-promotion when the starter is out
+    adjustments: dict[str, dict[str, Any]] = {t: {} for t in teams}
+    for team in teams:
+        tov = team_over.get(team, {})
+        qb = tov.get("starting_qb")
+        if qb is not None and not ((df["gsis_id"] == qb) & (df["team"] == team) & (df["position"] == "QB")).any():
+            raise KeyError(f"starting_qb {qb!r} is not a QB of {team} in this game")
+        has_starter = ((df["team"] == team) & df["is_starting_qb"] & df["active"]).any()
+        back = [df.at[i, "gsis_id"] for i, o in player_ov.items() if o.get("active") is True
+                and df.at[i, "team"] == team and df.at[i, "position"] == "QB"]
+        if qb is None and back and team_qb1(df, team) in back:
+            qb = team_qb1(df, team)         # the re-activated QB1 starts again
+        if qb is None and depth_adjust and not has_starter:
+            pool = df[(df["team"] == team) & (df["position"] == "QB") & ~df["is_out"].fillna(False).astype(bool)]
+            pool = pool[~pool.index.isin([i for i, o in player_ov.items() if o.get("active") is False])]
+            if len(pool):
+                qb = str(_qb_order(pool)["gsis_id"].iloc[0])
+        if qb is not None:
+            current = df.loc[(df["team"] == team) & df["is_starting_qb"] & df["active"], "gsis_id"].tolist()
+            if current != [qb]:
+                _set_starting_qb(df, team, qb, fixed)
+                changed.setdefault(team, []).extend(current + [qb])
+            adjustments[team]["starting_qb"] = qb
+
+    # 4) explicit per-player shares / efficiency
+    for i, ov in player_ov.items():
+        if ov.get("active") is False:
+            continue
+        team, pid = df.at[i, "team"], df.at[i, "gsis_id"]
         for c in ("target_share", "carry_share"):
             if c in ov:
                 df.at[i, c] = float(ov[c])
-                fixed[(team, c)].add(key)
+                fixed[(team, c)].add(pid)
         for c in ("catch_rate", "ypr", "ypc"):
             if c in ov:
                 df.at[i, c] = float(ov[c])
+                explicit_eff.add(pid)
     for (team, c), total in totals.items():
         _renormalize(df, c, team, fixed[(team, c)], total)
+
+    # 5) passing efficiency: backup QB and missing starting receivers
+    for team in teams:
+        tov = team_over.get(team, {})
+        starter = df.loc[(df["team"] == team) & df["is_starting_qb"] & df["active"], "gsis_id"].tolist()
+        f_qb = 1.0
+        if depth_adjust or "starting_qb" in tov:
+            qb1 = team_qb1(df, team)
+            if starter and qb1 is not None and starter[0] != qb1:
+                f_qb = float(tov.get("qb_efficiency", BACKUP_QB_EFFICIENCY))
+        f_miss, missing = 1.0, []
+        if depth_adjust:
+            share, missing = missing_starter_share(df, team)
+            f_miss = max(1.0 - MISSING_STARTER_PENALTY * share / MISSING_STARTER_UNIT, MIN_PASS_EFFICIENCY)
+        factor = max(f_qb * f_miss, MIN_PASS_EFFICIENCY)
+        _pass_efficiency(df, team, factor, explicit_eff)
+        adjustments[team].update({"qb_efficiency": f_qb, "missing_starter_factor": f_miss,
+                                  "missing_starters": missing, "pass_efficiency": factor,
+                                  "qb_attempt_share": float(tov.get("qb_attempt_share", 1.0)),
+                                  "changed_players": changed.get(team, [])})
+        if starter:
+            adjustments[team].setdefault("starting_qb", starter[0])
+    for team in teams:
+        team_over.setdefault(team, {})["_adjustments"] = adjustments[team]
     return df, team_over
+
+
+def weather_factors(weather: Mapping[str, Any] | None) -> dict[str, float]:
+    """Multipliers implied by a weather dict: ``pass_efficiency`` (yards per attempt), its
+    ``wet_cold`` part, and ``pass_rate``. Neutral (all 1.0) for domes or missing forecasts."""
+    out = {"wind_pass_efficiency": 1.0, "wet_cold": 1.0, "pass_rate": 1.0}
+    if not weather or weather.get("is_dome"):
+        return out
+    wind = float(weather.get("wind_mph") or 0.0)
+    excess = min(max(wind - WIND_THRESHOLD_MPH, 0.0), WIND_MAX_EXCESS_MPH)
+    out["wind_pass_efficiency"] = 1.0 - WIND_PASS_EFF_PER_MPH * excess
+    out["pass_rate"] = 1.0 - WIND_PASS_RATE_PER_MPH * excess
+    wet = float(weather.get("precip_prob") or 0) >= PRECIP_PROB_THRESHOLD
+    temp = weather.get("temp_f")
+    cold = temp is not None and float(temp) < COLD_TEMP_F
+    if wet and cold:
+        out["wet_cold"] = 1.0 - WET_AND_COLD_PENALTY
+    elif wet or cold:
+        out["wet_cold"] = 1.0 - WET_OR_COLD_PENALTY
+    return out
+
+
+def apply_weather(players: pd.DataFrame, params: Mapping[str, "TeamParams"], weather: Mapping[str, Any] | None
+                  ) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Scale both teams' receiving efficiency and pass rate for the game's weather (copies)."""
+    f = weather_factors(weather)
+    df = players.copy()
+    if f == {"wind_pass_efficiency": 1.0, "wet_cold": 1.0, "pass_rate": 1.0}:
+        return df, f
+    for team, p in params.items():
+        _pass_efficiency(df, team, f["wind_pass_efficiency"], set())
+        if f["wet_cold"] != 1.0:
+            m = df["team"] == team
+            w = f["wet_cold"]
+            df.loc[m, "catch_rate"] = np.clip(df.loc[m, "catch_rate"] * w ** WEATHER_CATCH_EXPONENT, 0.3, 0.95)
+            df.loc[m, "ypr"] = np.clip(df.loc[m, "ypr"] * w ** (1 - WEATHER_CATCH_EXPONENT), 3.0, 25.0)
+        p.pred_pass_rate = float(np.clip(p.pred_pass_rate * f["pass_rate"], 0.30, 0.80))
+    return df, f
+
+
+def depth_overrides(players: pd.DataFrame, inactive: Sequence[str] = (), reactivate: Sequence[str] = (),
+                    starting_qbs: Mapping[str, str] | None = None, qb_efficiency: float = BACKUP_QB_EFFICIENCY,
+                    qb_attempt_share: float = 1.0) -> dict[str, dict[str, Any]]:
+    """Dashboard depth spec (global lists of gsis_ids, team -> QB) -> overrides for one game.
+
+    Ids that are not in this game are ignored, so one spec can be applied to every game."""
+    ids = set(players["gsis_id"])
+    ov: dict[str, dict[str, Any]] = {}
+    for pid in reactivate:
+        if pid in ids:
+            ov[pid] = {"active": True}
+    for pid in inactive:
+        if pid in ids:
+            ov[pid] = {"active": False}
+    teams = set(players["team"])
+    qbs = set(players.loc[players["position"] == "QB", "gsis_id"])
+    for team, qb in (starting_qbs or {}).items():
+        if team in teams and qb in qbs and qb not in set(inactive):
+            ov[team] = {"starting_qb": qb, "qb_efficiency": float(qb_efficiency),
+                        "qb_attempt_share": float(qb_attempt_share)}
+    for team in teams:      # efficiency factor also applies to auto-promoted backups
+        ov.setdefault(team, {}).setdefault("qb_efficiency", float(qb_efficiency))
+        ov[team].setdefault("qb_attempt_share", float(qb_attempt_share))
+    return ov
 
 
 # ======================================================================================
@@ -476,6 +784,7 @@ class SimResult:
     stats: dict[str, dict[str, np.ndarray]]
     teams: dict[str, dict[str, np.ndarray]]
     inputs: dict[str, TeamParams] = field(default_factory=dict)
+    adjustments: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def get(self, gsis_id: str, stat: str) -> np.ndarray:
         if gsis_id not in self.stats:
@@ -661,9 +970,18 @@ def simulate(players: pd.DataFrame, team_params: Mapping[str, TeamParams], n_tri
                 incompletions = qb_attempts - completions
                 # INTs come out of incompletions; per-trial rate keeps E[INT] = int_rate x attempts.
                 p_int = np.clip(qb_int_rate * qb_attempts / np.maximum(incompletions, 1), 0.0, 1.0)
-                s.update({"pass_attempts": qb_attempts, "pass_completions": completions,
-                          "pass_yds": rec_yds.sum(axis=1), "pass_tds": pass_tds_team,
-                          "pass_interceptions": rng.binomial(incompletions, p_int)})
+                q = {"pass_attempts": qb_attempts, "pass_completions": completions,
+                     "pass_yds": rec_yds.sum(axis=1), "pass_tds": pass_tds_team,
+                     "pass_interceptions": rng.binomial(incompletions, p_int)}
+                share = float(np.clip(p.qb_attempt_share, 0.0, 1.0))
+                if share < 1.0:     # another QB takes the rest: thin his counts, yards per completion kept
+                    comp = rng.binomial(completions, share)
+                    ypc_trial = np.where(completions > 0, q["pass_yds"] / np.maximum(completions, 1), 0.0)
+                    q = {"pass_attempts": comp + rng.binomial(qb_attempts - completions, share),
+                         "pass_completions": comp, "pass_yds": np.rint(comp * ypc_trial),
+                         "pass_tds": rng.binomial(pass_tds_team, share),
+                         "pass_interceptions": rng.binomial(q["pass_interceptions"], share)}
+                s.update(q)
             stats[pid] = s
             td_counts.append(s["anytime_td"])
             td_owner.append(pid)
@@ -752,7 +1070,8 @@ def simulate_game(game_id: str, usage_overrides: Mapping[str, Mapping[str, Any]]
                   n_trials: int = N_TRIALS, seed: int | None = None, con: duckdb.DuckDBPyConnection | None = None,
                   db_path: Path = DEFAULT_DB_PATH, model: GameModel | None = None, kind: str = "ridge",
                   spread: float | None = None, total: float | None = None,
-                  allocation: str = "constrained") -> SimResult:
+                  allocation: str = "constrained", depth: Mapping[str, Any] | None = None,
+                  weather: Mapping[str, Any] | None = None) -> SimResult:
     """Simulate ``game_id`` ``n_trials`` times and return full per-player stat arrays.
 
     ``usage_overrides`` example::
@@ -760,6 +1079,13 @@ def simulate_game(game_id: str, usage_overrides: Mapping[str, Mapping[str, Any]]
         {"00-0036900": {"target_share": 0.30},           # bump a WR (teammates rescaled)
          "00-0038120": {"active": False},                  # rule a player out (share redistributed)
          "DET": {"pass_rate": 0.65, "points": 27.5}}       # team-level overrides
+
+    ``depth`` (dashboard): keyword arguments of :func:`depth_overrides` (``inactive``,
+    ``reactivate``, ``starting_qbs``, ``qb_efficiency``, ``qb_attempt_share``). Its overrides are
+    merged under ``usage_overrides`` and the depth-chart adjustments are enabled.
+
+    ``weather``: dict from ``weather_client.get_game_weather`` (see :func:`weather_factors`),
+    applied after the team-level overrides.
     """
     own = con is None
     con = con or duckdb.connect(str(db_path), read_only=True)
@@ -769,16 +1095,30 @@ def simulate_game(game_id: str, usage_overrides: Mapping[str, Mapping[str, Any]]
     finally:
         if own:
             con.close()
-    players, team_over = apply_usage_overrides(players, usage_overrides, list(params))
+    overrides: dict[str, dict[str, Any]] = {}
+    if depth is not None:
+        overrides = depth_overrides(players, **dict(depth))
+    for key, ov in (usage_overrides or {}).items():
+        overrides[key] = {**overrides.get(key, {}), **ov}
+    players, team_over = apply_usage_overrides(players, overrides, list(params), depth_adjust=depth is not None)
+    adjustments = {t: ov.pop("_adjustments") for t, ov in team_over.items() if "_adjustments" in ov}
     for team, ov in team_over.items():
         p = params[team]
+        if "qb_attempt_share" in ov:
+            p.qb_attempt_share = float(ov["qb_attempt_share"])
         if "points" in ov:
             p.pred_points = float(ov["points"])
         if "plays" in ov:
             p.pred_plays = float(ov["plays"])
         if "pass_rate" in ov:
             p.pred_pass_rate = float(ov["pass_rate"])
-    return simulate(players, params, n_trials=n_trials, seed=seed, game_id=game_id, allocation=allocation)
+    players, wf = apply_weather(players, params, weather)
+    if weather:
+        for team in params:
+            adjustments.setdefault(team, {})["weather"] = {**wf, "summary": weather.get("summary")}
+    res = simulate(players, params, n_trials=n_trials, seed=seed, game_id=game_id, allocation=allocation)
+    res.adjustments = adjustments
+    return res
 
 
 # ======================================================================================

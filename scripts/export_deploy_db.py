@@ -10,6 +10,10 @@ What is copied
 * Full copies of the tables the UI and simulations read: ``team_features``, ``player_features``,
   ``player_id_map``, ``schedules``, ``backtest_results``, ``backtest_bets``, ``raw_odds``,
   ``td_predictions``, ``rosters`` and ``players`` (the last two feed the entity resolver, rule 4).
+  ``player_features`` already carries the roster-only rows (backups / depth players with no recent
+  snaps, e.g. a QB2) built by ``player_usage``, so the full active roster reaches the UI selectors.
+* ``depth_charts`` reduced to the latest snapshot per (season, team) — what the app and
+  ``player_usage`` read — instead of every daily snapshot.
 * ``player_weekly`` slimmed to the id/date/stat columns used by the simulator's efficiency priors
   and prop settlement.
 * ``team_game_actuals``: the per-(game, offense) aggregate the game model trains on, computed
@@ -86,6 +90,16 @@ def export(src: Path = DEFAULT_SRC, dst: Path = DEFAULT_DST, max_mb: float = DEF
                 logger.warning("skipping %s (not in source DB)", t)
                 continue
             con.execute(f'CREATE TABLE main."{t}" AS SELECT * FROM src."{t}"')
+
+        if "depth_charts" in have:
+            con.execute("""
+                CREATE TABLE main.depth_charts AS
+                WITH d AS (SELECT *, COALESCE(CAST(snapshot_date AS VARCHAR), LPAD(CAST(week AS VARCHAR), 2, '0')) AS k
+                           FROM src.depth_charts),
+                     m AS (SELECT season, team, MAX(k) AS k FROM d GROUP BY ALL)
+                SELECT d.* EXCLUDE (k) FROM d JOIN m USING (season, team, k)""")
+        else:
+            logger.warning("skipping depth_charts (not in source DB)")
 
         if "player_weekly" in have:
             src_cols = _columns(con, "player_weekly")

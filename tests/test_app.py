@@ -381,7 +381,103 @@ def test_app_default_filters_hide_extreme_edges(env, no_network):
     at.toggle(key="scan_started").set_value(True).run()
     assert not at.exception, [e.value for e in at.exception]
     assert at.number_input(key="scan_max_edge").value == 15.0
-    assert at.number_input(key="scan_min_games").value == 3
+    assert at.number_input(key="scan_min_games").value == 5
+    assert at.number_input(key="scan_min_books").value == 3
+    assert at.sidebar.slider(key="min_edge_pct").value == 0.0  # set by the test; default is 2.5
     table = at.dataframe[0].value
     assert table.empty or (table["Edge %"] <= 15.0).all()
     assert any("Hidden by filters" in c.value for c in at.caption)
+
+
+# ======================================================================================
+# Injury & depth chart overrides, re-run button, defaults
+# ======================================================================================
+def test_depth_spec_is_canonical_and_reactivates_cleared_players():
+    a = state.depth_spec(["b", "a"], ["a", "c"], {"PHI": "qb2", "DAL": ""}, 0.85, 1.0)
+    b = state.depth_spec(["a", "b", "a"], ["c", "a"], {"PHI": "qb2"}, 0.85, 1.0)
+    assert a == b and state.depth_json(a) == state.depth_json(b)
+    assert a["inactive"] == ["a", "b"] and a["reactivate"] == ["c"] and a["starting_qbs"] == {"PHI": "qb2"}
+    assert state.manual_depth_ids(a) == {"qb2", "c"}
+
+
+def test_min_books_filter_and_manual_players_skip_history_filter():
+    ev = _evaluated().assign(n_books=[3, 2, 5, 3], manual_depth=[True, False, False, False])
+    d = state.filter_evaluated(ev, min_hist_games=5, min_books=3)
+    assert set(d["selection"]) == {"Rookie", "B", "Vet"} and len(d) == 3     # Rookie kept: activated by hand
+    assert (d["n_books"] >= 3).all()
+    assert (state.DEFAULT_MIN_EDGE_PCT, state.DEFAULT_MAX_EDGE_PCT, state.DEFAULT_MIN_HIST_GAMES,
+            state.DEFAULT_MIN_BOOKS) == (2.5, 15.0, 5, 3)
+    assert state.Settings().min_edge_pct == 2.5 and state.SESSION_DEFAULTS["min_edge_pct"] == 2.5
+
+
+def test_thin_history_props_blend_toward_market():
+    out = pd.DataFrame({"market_key": ["player_receptions", "player_receptions", "player_receptions", "spreads"],
+                        "hist_games": [0.0, 2.0, 10.0, np.nan], "model_prob": [0.05, 0.05, 0.05, 0.05],
+                        "fair_prob": [0.5, 0.5, 0.5, 0.5], "model_p_push": [0.0, 0.0, 0.0, 0.1]})
+    b = state.blend_thin_history(out)
+    w0 = state.MARKET_BLEND_MIN_WEIGHT
+    assert b["model_prob"].iloc[0] == pytest.approx(w0 * 0.05 + (1 - w0) * 0.5)      # rookie: mostly market
+    assert b["model_prob"].iloc[0] > b["model_prob"].iloc[1] > b["model_prob"].iloc[2] == pytest.approx(0.05)
+    assert b["model_prob"].iloc[3] == pytest.approx(0.05)                             # game market untouched
+    assert b["model_p_win"].iloc[0] == pytest.approx(b["model_prob"].iloc[0])
+
+
+def test_price_markets_skips_inactive_players(con, env):
+    base, _ = state.price_markets(con, n_trials=1000, include_started=True, depth={})
+    out, diag = state.price_markets(con, n_trials=1000, include_started=True,
+                                    depth=state.depth_spec([env["wr"]], [], {}, 0.85, 1.0))
+    assert (base["gsis_id"] == env["wr"]).any() and not (out["gsis_id"] == env["wr"]).any()
+    assert diag["inactive_players"] > 0
+    assert len(out[~out["market_key"].str.startswith("player_")]) == len(base[~base["market_key"].str.startswith("player_")])
+
+
+@pytest.fixture
+def slate(env, monkeypatch):
+    """Make the fixture's past game the 'upcoming slate' of the depth panel."""
+    gdate = pd.Timestamp(pd.Timestamp(env["now"]).date())
+    real = state.depth_players
+    monkeypatch.setattr(state, "depth_players", lambda con, today=None, days=8, unplayed_only=True:
+                        real(con, gdate, days, unplayed_only=False))
+    state.cached_depth_players.clear()
+    yield env
+    state.cached_depth_players.clear()
+
+
+def test_depth_panel_stages_and_rerun_applies(slate, no_network):
+    at = _run_app(min_edge_pct=0.0)
+    assert not at.exception, [e.value for e in at.exception]
+    ms = at.sidebar.multiselect(key="depth_inactive")
+    assert any(o.startswith(f"{slate['home']} WR1 (WR, {slate['home']})") for o in ms.options)
+    assert at.session_state["depth_applied"]["inactive"] == list(ms.value)   # injury report applied on load
+    ms.set_value([slate["wr"]]).run()
+    assert any("re-run the simulations" in w.value for w in at.sidebar.warning)
+    assert slate["wr"] not in at.session_state["depth_applied"]["inactive"]  # staged, not applied yet
+    runs = at.session_state["sim_runs"]
+    next(b for b in at.sidebar.button if b.label == "🔄 Re-run Match Simulations").click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert at.session_state["depth_applied"]["inactive"] == [slate["wr"]]
+    assert at.session_state["sim_runs"] == runs + 1
+    assert not any("re-run the simulations" in w.value for w in at.sidebar.warning)
+    # player sim: the ruled-out WR stays selectable but explains how to bring him back
+    at.toggle(key="exp_past").set_value(True).run()
+    at.selectbox(key="exp_game").set_value(slate["game_id"]).run()
+    at.selectbox(key="exp_player").set_value(slate["wr"]).run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert any("Inactive / Out" in i.value for i in at.info)
+    assert no_network == []
+
+
+def test_starting_qb_override_widget(slate, no_network):
+    at = _run_app()
+    team = at.sidebar.selectbox(key="qb_team").value
+    pick = at.sidebar.selectbox(key=f"qb_pick_{team}")
+    assert len(pick.options) == 2                                         # Auto + the team's QB
+    qb = f"{team}_QB"
+    pick.set_value(qb).run()
+    assert at.session_state["qb_staged"] == {team: qb}
+    next(b for b in at.sidebar.button if b.label == "🔄 Re-run Match Simulations").click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert at.session_state["depth_applied"]["starting_qbs"] == {team: qb}
+    at.sidebar.button(key="qb_clear").click().run()
+    assert at.session_state["qb_staged"] == {}
+    assert no_network == []

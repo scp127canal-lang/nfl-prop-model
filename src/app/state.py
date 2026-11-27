@@ -34,6 +34,7 @@ import streamlit as st
 from src.evaluation import backtest as bt
 from src.evaluation import devig as dv
 from src.ingestion import odds_client as oc
+from src.ingestion import weather_client as wc
 from src.models import game_sim as gs
 from src.utils import entity_resolution as er
 from src.utils.secrets import get_secret
@@ -113,7 +114,7 @@ def table_exists(con: duckdb.DuckDBPyConnection, table: str) -> bool:
 class Settings:
     bankroll: float = dv.DEFAULT_BANKROLL
     kelly: float = dv.DEFAULT_KELLY_FRACTION
-    min_edge_pct: float = 2.0
+    min_edge_pct: float = 2.5
     sharp_book: str = SHARP_AUTO
     devig_method: str = "shin"
     max_stake_pct: float = dv.DEFAULT_MAX_STAKE_PCT
@@ -127,9 +128,10 @@ class Settings:
 
 
 SESSION_DEFAULTS: dict[str, Any] = {
-    "bankroll": dv.DEFAULT_BANKROLL, "kelly": dv.DEFAULT_KELLY_FRACTION, "min_edge_pct": 2.0,
+    "bankroll": dv.DEFAULT_BANKROLL, "kelly": dv.DEFAULT_KELLY_FRACTION, "min_edge_pct": 2.5,
     "sharp_book": SHARP_AUTO, "devig_method": "shin", "last_pull": None, "pull_error": None,
-    "live_calls": 0,
+    "live_calls": 0, "qb_staged": {}, "qb_eff": gs.BACKUP_QB_EFFICIENCY, "qb_att_share": 1.0,
+    "depth_applied": None, "sim_runs": 0, "weather": {}, "weather_fetched_at": None,
 }
 
 
@@ -142,6 +144,171 @@ def settings_from_session() -> Settings:
     s = st.session_state
     return Settings(bankroll=float(s["bankroll"]), kelly=float(s["kelly"]), min_edge_pct=float(s["min_edge_pct"]),
                     sharp_book=s["sharp_book"], devig_method=s["devig_method"])
+
+
+# ======================================================================================
+# Injury & depth-chart overrides (global: scanner + player sim)
+# ======================================================================================
+DEFAULT_OUT_STATUSES = ("Out", "Doubtful", "IR")
+DEPTH_SLATE_DAYS = 14   # horizon for "each team's next game"
+
+
+def depth_players(con: duckdb.DuckDBPyConnection, today: pd.Timestamp | None = None,
+                  days: int = DEPTH_SLATE_DAYS, unplayed_only: bool = True) -> pd.DataFrame:
+    """Every skill player (incl. roster-only backups) of the upcoming slate: each team's next
+    unplayed game from yesterday through ``days`` ahead (so a team coming off a Thursday game is
+    still listed), one row per player. ``default_out`` marks players listed
+    Out / Doubtful / IR (or otherwise out per the roster), the multiselect's preloaded value."""
+    cols = ["gsis_id", "player_name", "position", "team", "game_id", "game_date", "injury_status", "is_out",
+            "roster_only", "depth_rank", "qual_games", "default_out", "label"]
+    if not table_exists(con, "player_features"):
+        return pd.DataFrame(columns=cols)
+    today = (today or pd.Timestamp.now()).normalize()
+    have = {r[0] for r in con.execute("DESCRIBE player_features").fetchall()}
+    opt = {"roster_only": "FALSE", "depth_rank": "NULL::DOUBLE", "qual_games": "prior_games"}
+    extra = ", ".join(f"{c if c in have else d} AS {c}" for c, d in opt.items())
+    sched_cols = {r[0] for r in con.execute("DESCRIBE schedules").fetchall()}
+    unplayed = "AND home_score IS NULL" if unplayed_only and "home_score" in sched_cols else ""
+    df = con.execute(f"""
+        WITH tg AS (SELECT game_id, game_date, home_team AS team FROM schedules WHERE TRUE {unplayed}
+                    UNION ALL SELECT game_id, game_date, away_team FROM schedules WHERE TRUE {unplayed}),
+             nxt AS (SELECT team, game_id FROM tg WHERE game_date BETWEEN ? AND ?
+                     QUALIFY ROW_NUMBER() OVER (PARTITION BY team ORDER BY game_date, game_id) = 1)
+        SELECT f.gsis_id, f.player_name, f.position, f.team, f.game_id, f.game_date, f.injury_status, f.is_out, {extra}
+        FROM player_features f JOIN nxt USING (team, game_id)
+        WHERE f.eligible AND f.position IN ('QB', 'RB', 'FB', 'WR', 'TE')
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY f.gsis_id ORDER BY f.game_date) = 1""",
+                     [(today - pd.Timedelta(days=1)).date(), (today + pd.Timedelta(days=days)).date()]).df()
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    df["is_out"] = df["is_out"].fillna(False).astype(bool)
+    df["default_out"] = df["is_out"] | df["injury_status"].isin(DEFAULT_OUT_STATUSES)
+    status = df["injury_status"].fillna("").astype(str)
+    df["label"] = (df["player_name"].astype(str) + " (" + df["position"] + ", " + df["team"] + ")"
+                   + np.where(status != "", " · " + status, "")
+                   + np.where(df["roster_only"].fillna(False).astype(bool), " · depth", ""))
+    order = {"QB": 0, "RB": 1, "WR": 2, "TE": 3, "FB": 4}
+    df = df.assign(_o=df["position"].map(order)).sort_values(["team", "_o", "depth_rank", "player_name"])
+    return df.drop(columns="_o").reset_index(drop=True)[cols]
+
+
+def depth_spec(inactive: Sequence[str], default_out: Sequence[str], starting_qbs: dict[str, str],
+               qb_efficiency: float, qb_attempt_share: float) -> dict[str, Any]:
+    """Canonical (JSON-able, order-free) spec for ``game_sim.simulate_game(depth=...)``.
+
+    Players listed out by default but cleared by the user are re-activated explicitly."""
+    inactive = sorted(set(inactive))
+    return {"inactive": inactive, "reactivate": sorted(set(default_out) - set(inactive)),
+            "starting_qbs": {t: q for t, q in sorted(starting_qbs.items()) if q},
+            "qb_efficiency": round(float(qb_efficiency), 4), "qb_attempt_share": round(float(qb_attempt_share), 4)}
+
+
+def depth_json(spec: dict[str, Any] | None) -> str:
+    return json.dumps(spec, sort_keys=True) if spec is not None else "null"
+
+
+def staged_depth_spec(players: pd.DataFrame) -> dict[str, Any]:
+    s = st.session_state
+    default_out = players.loc[players["default_out"], "gsis_id"].tolist() if not players.empty else []
+    return depth_spec(s.get("depth_inactive", default_out), default_out, s.get("qb_staged", {}),
+                      s.get("qb_eff", gs.BACKUP_QB_EFFICIENCY), s.get("qb_att_share", 1.0))
+
+
+def applied_depth_spec() -> dict[str, Any]:
+    spec = st.session_state.get("depth_applied")
+    return spec if spec is not None else depth_spec([], [], {}, gs.BACKUP_QB_EFFICIENCY, 1.0)
+
+
+def manual_depth_ids(spec: dict[str, Any] | None) -> set[str]:
+    """Players the user brought in by hand (starting-QB picks, re-activated players): never
+    hidden by the scanner's history filter."""
+    if not spec:
+        return set()
+    return set(spec.get("starting_qbs", {}).values()) | set(spec.get("reactivate", []))
+
+
+# ======================================================================================
+# Game weather (Open-Meteo; fetched only from the Re-run button callback)
+# ======================================================================================
+def game_weather_inputs(con: duckdb.DuckDBPyConnection, game_ids: Sequence[str] | None = None,
+                        today: pd.Timestamp | None = None,
+                        days: int = wc.FORECAST_HORIZON_DAYS) -> pd.DataFrame:
+    """Home team, UTC kickoff, roof and neutral-site flag per game (unplayed games within the
+    forecast horizon when ``game_ids`` is None)."""
+    out_cols = ["game_id", "home_team", "kickoff_utc", "roof", "neutral_site"]
+    cols = {r[0] for r in con.execute("DESCRIBE schedules").fetchall()}
+
+    def pick(c: str, default: str = "NULL") -> str:
+        return c if c in cols else f"{default} AS {c}"
+    q = (f"SELECT game_id, home_team, game_date, {pick('gameday', 'CAST(game_date AS VARCHAR)')}, "
+         f"{pick('gametime')}, {pick('roof')}, {pick('location')} FROM schedules")
+    if game_ids is not None:
+        if not game_ids:
+            return pd.DataFrame(columns=out_cols)
+        df = con.execute(q + f" WHERE game_id IN ({','.join('?' * len(game_ids))})", list(game_ids)).df()
+    else:
+        today = (today or pd.Timestamp.now()).normalize()
+        unplayed = " AND home_score IS NULL" if "home_score" in cols else ""
+        df = con.execute(q + f" WHERE game_date BETWEEN ? AND ?{unplayed}",
+                         [(today - pd.Timedelta(days=1)).date(), (today + pd.Timedelta(days=days)).date()]).df()
+    if df.empty:
+        return pd.DataFrame(columns=out_cols)
+    df["kickoff_utc"] = [wc.kickoff_utc(d, t) for d, t in zip(df["gameday"], df["gametime"])]
+    df["neutral_site"] = df["location"].astype(str).str.lower().eq("neutral")
+    df["roof"] = df["roof"].astype(object).where(df["roof"].notna(), None)
+    return df[out_cols]
+
+
+def controlled_weather(con: duckdb.DuckDBPyConnection, game_id: str) -> dict[str, Any] | None:
+    """Dome / closed-roof weather for ``game_id`` without any HTTP call; None if outdoor."""
+    g = game_weather_inputs(con, [game_id])
+    if g.empty:
+        return None
+    r = g.iloc[0]
+    if r["neutral_site"] or not wc.is_controlled(r["home_team"], r["roof"]):
+        return None
+    return dict(wc.DOME_WEATHER)
+
+
+def fetch_slate_weather(con: duckdb.DuckDBPyConnection, today: pd.Timestamp | None = None) -> dict[str, dict]:
+    """Weather for every unplayed game in the forecast horizon (domes need no request)."""
+    out = {}
+    for r in game_weather_inputs(con, today=today).itertuples(index=False):
+        if r.kickoff_utc is None:
+            continue
+        out[r.game_id] = wc.get_game_weather(r.home_team, r.kickoff_utc, r.roof, bool(r.neutral_site))
+    return out
+
+
+def game_weather(version: str, game_id: str) -> dict[str, Any] | None:
+    """Weather used for ``game_id``: the last fetched forecast, else dome weather, else None
+    (outdoor game not fetched yet -> no weather adjustment)."""
+    w = st.session_state.get("weather", {}).get(game_id)
+    return w if w is not None else cached_controlled_weather(version, game_id)
+
+
+def weather_json(weather: dict | None) -> str:
+    return json.dumps(weather, sort_keys=True, default=str) if weather else "null"
+
+
+def clear_simulation_caches() -> None:
+    cached_price_markets.clear()
+    cached_simulation.clear()
+    cached_players.clear()
+
+
+def rerun_simulations_callback(spec: dict[str, Any]) -> None:
+    """``on_click`` of "Re-run Match Simulations": apply the staged injury / depth overrides and
+    recompute every 10k-trial simulation (scanner + player sim). Makes no HTTP calls."""
+    st.session_state["depth_applied"] = spec
+    st.session_state["sim_runs"] = st.session_state.get("sim_runs", 0) + 1
+    try:    # live weather: only here, on the explicit button click (rule 2)
+        with connect() as con:
+            st.session_state["weather"] = fetch_slate_weather(con)
+        st.session_state["weather_fetched_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    except Exception:  # noqa: BLE001 - weather is optional; never block the re-run
+        logger.exception("weather refresh failed")
+    clear_simulation_caches()
 
 
 # ======================================================================================
@@ -212,11 +379,13 @@ def _p_over(x: np.ndarray, line: float) -> tuple[float, float]:
 
 
 def simulate_for_game(con: duckdb.DuckDBPyConnection, game_id: str, n_trials: int, seed: int,
-                      overrides: dict | None = None) -> tuple[gs.SimResult | None, tuple[np.ndarray, np.ndarray] | None]:
+                      overrides: dict | None = None, depth: dict | None = None, weather: dict | None = None
+                      ) -> tuple[gs.SimResult | None, tuple[np.ndarray, np.ndarray] | None]:
     """(player SimResult or None, (home_pts, away_pts) or None). Game model trained < game date."""
     home, away = con.execute("SELECT home_team, away_team FROM schedules WHERE game_id = ?", [game_id]).fetchall()[0]
     try:
-        sim = gs.simulate_game(game_id, overrides, con=con, n_trials=n_trials, seed=seed)
+        sim = gs.simulate_game(game_id, overrides, con=con, n_trials=n_trials, seed=seed, depth=depth,
+                               weather=weather)
         return sim, (sim.teams[home]["points"], sim.teams[away]["points"])
     except ValueError as exc:
         logger.info("player sim unavailable for %s (%s); scores only", game_id, exc)
@@ -237,15 +406,45 @@ def player_history(sim: gs.SimResult | None) -> dict[str, tuple[float, bool]]:
     return {pid: (float(q), bool(c)) for pid, q, c in zip(sim.players["gsis_id"], sim.players["qual_games"], cold)}
 
 
+MARKET_BLEND_MIN_WEIGHT = 0.35   # model weight for a player with 0 qualifying games
+
+
+def blend_thin_history(out: pd.DataFrame, min_games: int = gs.COLD_START_GAMES,
+                       w_min: float = MARKET_BLEND_MIN_WEIGHT) -> pd.DataFrame:
+    """Shrink player-prop probabilities of thin-history players (< ``min_games`` qualifying
+    games: rookies, backups) toward the devigged market line.
+
+    The simulator already blends their usage with a positional role prior; the remaining
+    uncertainty is large, so p = w * model + (1 - w) * fair with w = w_min + (1 - w_min) * games /
+    min_games. Avoids e.g. -800 "fair" Unders on a promoted backup. Game markets are untouched."""
+    o = out.copy()
+    hist = pd.to_numeric(o["hist_games"], errors="coerce")
+    thin = o["market_key"].str.startswith("player_") & hist.notna() & (hist < min_games) & o["fair_prob"].notna()
+    w = (w_min + (1 - w_min) * np.clip(hist / min_games, 0.0, 1.0)).where(thin, 1.0)
+    o["market_blend_weight"] = w.astype(float)
+    p = (w * o["model_prob"] + (1 - w) * o["fair_prob"]).clip(bt.EPS, 1 - bt.EPS)
+    o["model_prob"] = p
+    o["model_p_win"] = p * (1 - o["model_p_push"].clip(0, 0.999))
+    return o
+
+
 def price_markets(con: duckdb.DuckDBPyConnection, sharp_priority: Sequence[str] = dv.SHARP_BOOKS,
                   devig_method: str = "shin", n_trials: int = gs.N_TRIALS, seed: int = 11,
-                  include_started: bool = False, now: datetime | None = None) -> tuple[pd.DataFrame, dict]:
+                  include_started: bool = False, now: datetime | None = None,
+                  depth: dict | None = None, weather: dict[str, dict] | None = None) -> tuple[pd.DataFrame, dict]:
     """Every quoted selection with devigged fair probability, best price and model probability.
 
     Fair probabilities always come from :func:`devig.fair_probabilities` (sharp book first,
     consensus fallback, rule 5); player names go through the entity resolver (rule 4).
+    ``depth`` is the dashboard's injury / depth-chart spec (``depth_spec``): inactive players'
+    props are skipped, every game is simulated with it, and TD-model probabilities are scaled by
+    the simulated change for teams it affects. ``weather`` maps game_id -> weather dict
+    (``weather_client``); a game without an entry gets dome weather if it has a roof, else none.
     """
-    diag: dict[str, Any] = {"unmatched_players": [], "unsupported_markets": {}, "games_without_model": []}
+    diag: dict[str, Any] = {"unmatched_players": [], "unsupported_markets": {}, "games_without_model": [],
+                            "inactive_players": 0}
+    inactive = set((depth or {}).get("inactive", []))
+    manual = manual_depth_ids(depth)
     odds = latest_odds(con, include_started, now)
     if odds.empty:
         return pd.DataFrame(), diag
@@ -267,11 +466,13 @@ def price_markets(con: duckdb.DuckDBPyConnection, sharp_priority: Sequence[str] 
 
     rows = []
     for gid, g in fair.groupby("game_id", sort=False):
-        sim, scores = simulate_for_game(con, gid, n_trials, seed)
+        w = (weather or {}).get(gid) or controlled_weather(con, gid)
+        sim, scores = simulate_for_game(con, gid, n_trials, seed, depth=depth, weather=w)
         if scores is None:
             diag["games_without_model"].append(gid)
             continue
-        depth = player_history(sim)
+        hist_depth = player_history(sim)
+        base_sim: list[gs.SimResult | None] = []      # lazily simulated without overrides (TD scaling)
         for r in g.itertuples(index=False):
             mk, name = r.market_key, r.outcome_name
             point = None if pd.isna(r.outcome_point) else float(r.outcome_point)
@@ -299,9 +500,17 @@ def price_markets(con: duckdb.DuckDBPyConnection, sharp_priority: Sequence[str] 
                     key = "unmatched_player" if stat is not None else base
                     diag["unsupported_markets"][key] = diag["unsupported_markets"].get(key, 0) + 1
                     continue
+                if pid in inactive:
+                    diag["inactive_players"] += 1
+                    continue
                 if stat in TD_STATS:
                     tp = tdp[(tdp["game_id"] == gid) & (tdp["gsis_id"] == pid)]
-                    if len(tp):
+                    if len(tp) and sim is not None and (depth is not None or w) and _depth_touches(sim, pid):
+                        if not base_sim:
+                            base_sim.append(simulate_for_game(con, gid, n_trials, seed)[0])
+                        p_yes = float(tp[f"p_{stat}"].iloc[0]) * _td_ratio(sim, base_sim[0], pid, stat)
+                        p_yes = float(np.clip(p_yes, bt.EPS, 1 - bt.EPS))
+                    elif len(tp):
                         p_yes = float(tp[f"p_{stat}"].iloc[0])
                     elif sim is not None and pid in sim.stats:
                         p_yes = sim.prob_at_least(pid, stat, 1)
@@ -325,15 +534,37 @@ def price_markets(con: duckdb.DuckDBPyConnection, sharp_priority: Sequence[str] 
                 "best_decimal": r.best_price_decimal, "fair_prob": r.fair_prob, "fair_source": r.fair_source,
                 "devig_method": r.devig_method, "n_books": r.n_books, "model_p_win": float(p_win),
                 "model_p_push": float(p_push), "selection_key": r.selection_key,
-                "hist_games": depth.get(r.gsis_id, (np.nan, False))[0] if isinstance(r.gsis_id, str) else np.nan,
-                "cold_start": bool(depth.get(r.gsis_id, (np.nan, False))[1]) if isinstance(r.gsis_id, str) else False})
+                "hist_games": hist_depth.get(r.gsis_id, (np.nan, False))[0] if isinstance(r.gsis_id, str) else np.nan,
+                "cold_start": bool(hist_depth.get(r.gsis_id, (np.nan, False))[1]) if isinstance(r.gsis_id, str) else False,
+                "manual_depth": isinstance(r.gsis_id, str) and r.gsis_id in manual})
     out = pd.DataFrame(rows)
     if out.empty:
         return out, diag
     out["model_prob"] = (out["model_p_win"] / (1 - out["model_p_push"].clip(0, 0.999))).clip(bt.EPS, 1 - bt.EPS)
+    out = blend_thin_history(out)
     out["fair_american"] = dv.decimal_to_american(1 / out["fair_prob"].clip(bt.EPS, 1 - bt.EPS))
     out["model_american"] = dv.decimal_to_american(1 / out["model_prob"])
     return out, diag
+
+
+def _depth_touches(sim: gs.SimResult, gsis_id: str) -> bool:
+    """Did the depth overrides change this player's team (outs, QB swap, efficiency)?"""
+    pl = sim.players.set_index("gsis_id")
+    if gsis_id not in pl.index:
+        return False
+    adj = sim.adjustments.get(pl.at[gsis_id, "team"], {})
+    wf = adj.get("weather") or {}
+    if any(abs(float(wf.get(k, 1.0)) - 1.0) > 1e-9 for k in ("wind_pass_efficiency", "wet_cold", "pass_rate")):
+        return True
+    return (abs(adj.get("pass_efficiency", 1.0) - 1.0) > 1e-9 or abs(adj.get("qb_attempt_share", 1.0) - 1.0) > 1e-9
+            or bool(adj.get("changed_players")))
+
+
+def _td_ratio(sim: gs.SimResult, base: gs.SimResult | None, gsis_id: str, stat: str) -> float:
+    """Simulated TD probability with / without the depth overrides (clipped to [0.25, 3])."""
+    if base is None or gsis_id not in sim.stats or gsis_id not in base.stats:
+        return 1.0
+    return float(np.clip(sim.prob_at_least(gsis_id, stat, 1) / base.prob_at_least(gsis_id, stat, 1), 0.25, 3.0))
 
 
 def apply_bankroll(priced: pd.DataFrame, settings: Settings) -> pd.DataFrame:
@@ -354,19 +585,23 @@ SCANNER_COLUMNS = {"game": "Game", "selection": "Player/Team", "market_key": "Ma
                    "fair_american": "Sharp No-Vig Fair", "model_american": "Model Fair", "edge_pct": "Edge %",
                    "ev_pct": "EV %", "kelly_stake": "Kelly Stake $", "hist_games": "Hist. Games",
                    "fair_source": "Fair Source", "n_books": "Books"}
+DEFAULT_MIN_EDGE_PCT = 2.5
 DEFAULT_MAX_EDGE_PCT = 15.0
-DEFAULT_MIN_HIST_GAMES = 3
+DEFAULT_MIN_HIST_GAMES = 5
+DEFAULT_MIN_BOOKS = 3
 
 
 def filter_evaluated(evaluated: pd.DataFrame, positive_only: bool = True, categories: Sequence[str] | None = None,
                      games: Sequence[str] | None = None, books: Sequence[str] | None = None,
                      include_alternates: bool = True, max_edge_pct: float | None = None,
-                     min_hist_games: int | None = None) -> pd.DataFrame:
+                     min_hist_games: int | None = None, min_books: int | None = None) -> pd.DataFrame:
     """Row filter behind the scanner table and its KPIs.
 
     ``max_edge_pct`` drops selections whose edge exceeds the cap (edges that large are almost
     always model error, e.g. thin-history players, not market error). ``min_hist_games`` drops
-    player props for players with fewer games above 20% snap share; game markets are unaffected.
+    player props for players with fewer games above 20% snap share; game markets are unaffected,
+    and so are players the user brought in by hand (``manual_depth``: starting-QB pick or
+    re-activated). ``min_books`` drops selections quoted by fewer books.
     """
     d = evaluated
     if d.empty:
@@ -386,7 +621,10 @@ def filter_evaluated(evaluated: pd.DataFrame, positive_only: bool = True, catego
     if min_hist_games:
         hist = d["hist_games"] if "hist_games" in d else pd.Series(np.nan, index=d.index)
         is_prop = d["market_key"].str.startswith("player_")
-        d = d[~is_prop | (hist.fillna(0) >= min_hist_games)]
+        manual = d["manual_depth"].fillna(False).astype(bool) if "manual_depth" in d else False
+        d = d[~is_prop | (hist.fillna(0) >= min_hist_games) | manual]
+    if min_books:
+        d = d[d["n_books"].fillna(0) >= min_books]
     return d
 
 
@@ -402,9 +640,9 @@ def format_scanner(d: pd.DataFrame) -> pd.DataFrame:
 def scanner_table(evaluated: pd.DataFrame, positive_only: bool = True, categories: Sequence[str] | None = None,
                   games: Sequence[str] | None = None, books: Sequence[str] | None = None,
                   include_alternates: bool = True, max_edge_pct: float | None = None,
-                  min_hist_games: int | None = None) -> pd.DataFrame:
+                  min_hist_games: int | None = None, min_books: int | None = None) -> pd.DataFrame:
     return format_scanner(filter_evaluated(evaluated, positive_only, categories, games, books, include_alternates,
-                                           max_edge_pct, min_hist_games))
+                                           max_edge_pct, min_hist_games, min_books))
 
 
 # ======================================================================================
@@ -480,9 +718,10 @@ def explorer_games(con: duckdb.DuckDBPyConnection, include_past: bool = False,
 
 
 def usage_overrides(player: pd.Series, target_share: float, carry_share: float, snap_share: float,
-                    tol: float = 1e-4) -> dict[str, dict[str, float]]:
+                    tol: float = 1e-3) -> dict[str, dict[str, float]]:
     """Override dict for ``simulate_game``. Snap share scales opportunity: shares are multiplied
-    by ``snap_share / baseline snap share`` (teammates are rescaled by the simulator)."""
+    by ``snap_share / baseline snap share`` (teammates are rescaled by the simulator). ``tol``
+    exceeds the sliders' 3-decimal rounding, so an untouched slider is never an override."""
     base_snap = float(player.get("snap_share_ewm5") or 0.0)
     ratio = snap_share / base_snap if base_snap > tol else 1.0
     t, c = target_share * ratio, carry_share * ratio
@@ -723,9 +962,23 @@ def cached_latest_odds(version: str, include_started: bool) -> pd.DataFrame:
 
 @st.cache_data(show_spinner="Simulating games & pricing every market…", ttl=600)
 def cached_price_markets(version: str, sharp_priority: tuple[str, ...], devig_method: str, n_trials: int,
-                         seed: int, include_started: bool) -> tuple[pd.DataFrame, dict]:
+                         seed: int, include_started: bool, depth: str = "null",
+                         weather: str = "null") -> tuple[pd.DataFrame, dict]:
     with connect() as con:
-        return price_markets(con, sharp_priority, devig_method, n_trials, seed, include_started)
+        return price_markets(con, sharp_priority, devig_method, n_trials, seed, include_started,
+                             depth=json.loads(depth), weather=json.loads(weather))
+
+
+@st.cache_data(show_spinner=False)
+def cached_controlled_weather(version: str, game_id: str) -> dict | None:
+    with connect() as con:
+        return controlled_weather(con, game_id)
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def cached_depth_players(version: str) -> pd.DataFrame:
+    with connect() as con:
+        return depth_players(con)
 
 
 @st.cache_data(show_spinner=False)
@@ -748,12 +1001,14 @@ def cached_game_model(version: str, game_date: str, kind: str = "ridge") -> gs.G
 
 
 @st.cache_data(show_spinner="Running Monte Carlo…", max_entries=48)
-def cached_simulation(version: str, game_id: str, overrides_json: str, n_trials: int, seed: int) -> gs.SimResult:
+def cached_simulation(version: str, game_id: str, overrides_json: str, n_trials: int, seed: int,
+                      depth: str = "null", weather: str = "null") -> gs.SimResult:
     with connect() as con:
         gdate = con.execute("SELECT game_date FROM schedules WHERE game_id = ?", [game_id]).fetchall()[0][0]
         model = cached_game_model(version, str(gdate))
         return gs.simulate_game(game_id, json.loads(overrides_json) or None, con=con, model=model,
-                                n_trials=n_trials, seed=seed)
+                                n_trials=n_trials, seed=seed, depth=json.loads(depth),
+                                weather=json.loads(weather))
 
 
 @st.cache_data(show_spinner=False)

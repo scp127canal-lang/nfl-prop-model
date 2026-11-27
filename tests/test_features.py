@@ -487,3 +487,78 @@ def test_expected_snap_weights_latest_game_and_sets_tier():
     p = pu.attach_usage_prior(panel, stats).iloc[0]
     assert p["snap_share_expected"] == pytest.approx(0.6 * 0.61 + 0.4 * 0.45)
     assert p["usage_tier"] == 1                                            # starter tier (0.5-0.8)
+
+
+# ======================================================================================
+# Full roster / depth chart for upcoming games
+# ======================================================================================
+def with_roster(league: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """Current-season roster snapshot with statuses + a depth chart:
+
+    * DET_QB2 / DET_WR4: active backups with no snaps at all (must still get rows);
+    * GB_WR2 on reserve/IR, CHI_RB2 cut, MIN_WR3 traded to GB."""
+    out = {k: v.copy() for k, v in league.items()}
+    r = out["rosters"].assign(status="ACT", week=UPCOMING_WEEK)
+    extra = pd.DataFrame([{"gsis_id": "DET_QB2", "full_name": "DET QB2", "position": "QB", "season": SEASON,
+                           "team": "DET", "status": "ACT", "week": UPCOMING_WEEK},
+                          {"gsis_id": "DET_WR4", "full_name": "DET WR4", "position": "WR", "season": SEASON,
+                           "team": "DET", "status": "ACT", "week": UPCOMING_WEEK}])
+    r = pd.concat([r, extra], ignore_index=True)
+    r.loc[r.gsis_id == "GB_WR2", "status"] = "RES"
+    r.loc[r.gsis_id == "CHI_RB2", "status"] = "CUT"
+    r.loc[r.gsis_id == "MIN_WR3", "team"] = "GB"
+    out["rosters"] = r
+    depth = [("DET", "DET_QB", "QB", 1), ("DET", "DET_QB2", "QB", 2), ("DET", "DET_WR1", "WR", 1),
+             ("DET", "DET_WR2", "WR", 2), ("DET", "DET_WR3", "WR", 3), ("DET", "DET_WR4", "WR", 4)]
+    out["depth_charts"] = pd.DataFrame([{"season": SEASON, "week": None, "snapshot_date": game_date(UPCOMING_WEEK) - timedelta(days=2),
+                                         "team": t, "gsis_id": g, "player_name": g, "position": p, "depth_rank": k}
+                                        for t, g, p, k in depth])
+    return out
+
+
+@pytest.fixture(scope="module")
+def roster_player(tmp_path_factory):
+    return player_feats(with_roster(LEAGUE), tmp_path_factory.mktemp("r") / "roster.duckdb")
+
+
+def _row(df, gsis_id, week=UPCOMING_WEEK, team=None):
+    d = df[(df.gsis_id == gsis_id) & (df.week == week)]
+    return d[d.team == team].iloc[0] if team else d.iloc[0]
+
+
+def test_backups_without_snaps_get_roster_rows(roster_player):
+    qb2, wr4 = _row(roster_player, "DET_QB2"), _row(roster_player, "DET_WR4")
+    for r in (qb2, wr4):
+        assert r["eligible"] and r["roster_only"] and r["roster_status"] == "ACT" and r["prior_games"] == 0
+    assert qb2["player_name"] == "DET QB2" and qb2["depth_rank"] == 2
+    assert qb2["snap_share_expected"] == 0.0                              # backup QB: no usage prior
+    assert wr4["snap_share_expected"] == pytest.approx(pu.DEPTH_SNAP_PRIOR["WR"][3])
+    assert 0 < wr4["target_share_prior"] < 0.1                            # conservative, not zero
+    assert not roster_player[roster_player.week < UPCOMING_WEEK]["roster_only"].any()
+
+
+def test_roster_status_marks_ir_and_drops_cut_or_traded(roster_player):
+    wr2 = _row(roster_player, "GB_WR2")
+    assert wr2["is_out"] and wr2["injury_status"] == "IR"
+    assert wr2["target_share_ewm5_adj"] == 0.0 and wr2["is_top2"]         # spillover to healthy teammates
+    gb_wr1 = _row(roster_player, "GB_WR1")
+    assert gb_wr1["target_share_ewm5_adj"] > gb_wr1["target_share_ewm5"]
+    up = roster_player[roster_player.week == UPCOMING_WEEK]
+    assert "CHI_RB2" not in set(up.gsis_id)                                # cut: not on the team any more
+    moved = up[up.gsis_id == "MIN_WR3"]
+    assert list(moved.team) == ["GB"] and moved["roster_only"].all()        # traded: new team's backup row
+
+
+def test_roster_context_never_touches_played_games(full_player, roster_player):
+    keys = ["game_id", "gsis_id"]
+    a = full_player[full_player.week < UPCOMING_WEEK].drop(columns=["roster_only", "roster_status", "depth_rank"])
+    b = roster_player[roster_player.week < UPCOMING_WEEK].drop(columns=["roster_only", "roster_status", "depth_rank"])
+    assert_same(a, b, keys, "played weeks")
+    played = roster_player[roster_player.week < UPCOMING_WEEK]
+    assert played["roster_status"].isna().all() and played["depth_rank"].isna().all()
+
+
+def test_depth_snap_prior_tiers():
+    pos = pd.Series(["QB", "QB", "RB", "WR", "WR", "TE"])
+    got = pu.depth_snap_prior(pos, pd.Series([1, 2, 9, 3, None, 2])).tolist()
+    assert got == [0.97, 0.0, 0.12, 0.55, pu.NO_DEPTH_SNAP_PRIOR["WR"], 0.30]

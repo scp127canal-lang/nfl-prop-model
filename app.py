@@ -52,8 +52,105 @@ def sidebar(version: str) -> state.Settings:
                       "remaining sharp books, then a consensus of devigged books.")
     sb.radio("Devig method", ["shin", "multiplicative"], key="devig_method", horizontal=True)
 
+    depth_panel(version)
     live_odds_panel(version)
     return state.settings_from_session()
+
+
+# ======================================================================================
+# Injury & depth chart overrides (global: scanner + player sim)
+# ======================================================================================
+RERUN_LABEL = "🔄 Re-run Match Simulations"
+AUTO_QB = "auto"
+
+
+def _store_qb_pick(team: str) -> None:
+    staged = dict(st.session_state.get("qb_staged", {}))
+    pick = st.session_state.get(f"qb_pick_{team}", AUTO_QB)
+    if pick == AUTO_QB:
+        staged.pop(team, None)
+    else:
+        staged[team] = pick
+    st.session_state["qb_staged"] = staged
+
+
+def _clear_qb_picks() -> None:
+    st.session_state["qb_staged"] = {}
+    for k in [k for k in st.session_state if str(k).startswith("qb_pick_")]:
+        st.session_state[k] = AUTO_QB
+
+
+def depth_panel(version: str) -> None:
+    """Inactive list + starting-QB replacement. Changes are staged; the Re-run button applies
+    them (and clears the simulation caches) for the +EV scanner and the player sim alike."""
+    sb = st.sidebar
+    sb.subheader("Injury & depth chart overrides")
+    players = state.cached_depth_players(version)
+    ids = players["gsis_id"].tolist()
+    default_out = players.loc[players["default_out"], "gsis_id"].tolist()
+    if "depth_inactive" not in st.session_state:
+        st.session_state["depth_inactive"] = default_out
+    else:   # drop ids that left the slate (new DB version) so the widget value stays valid
+        st.session_state["depth_inactive"] = [i for i in st.session_state["depth_inactive"] if i in set(ids)]
+    labels = dict(zip(players["gsis_id"], players["label"]))
+    sb.multiselect("Inactive / Out players", ids, key="depth_inactive", format_func=lambda i: labels.get(i, i),
+                   placeholder="Nobody ruled out",
+                   help="Preloaded with players listed Out, Doubtful or IR for this week's slate. Their target, "
+                        "carry and snap share go to 0 and their volume is redistributed to active teammates. "
+                        "Missing WR1/WR2/TE1 also lowers the QB's yards per attempt (≈13.5% per 0.25 target "
+                        "share). Remove a player to re-activate him.")
+
+    qbs = players[players["position"] == "QB"]
+    teams = sorted(qbs["team"].unique())
+    if teams:
+        team = sb.selectbox("Team (starting QB override)", teams, key="qb_team")
+        options = [AUTO_QB] + qbs.loc[qbs["team"] == team, "gsis_id"].tolist()
+        key = f"qb_pick_{team}"
+        current = st.session_state.get("qb_staged", {}).get(team, AUTO_QB)
+        if st.session_state.get(key) not in options:
+            st.session_state[key] = current if current in options else AUTO_QB
+        sb.selectbox("Starting QB / key replacement", options, key=key, on_change=_store_qb_pick, args=(team,),
+                     format_func=lambda i: "Auto (depth chart, healthy QB)" if i == AUTO_QB else labels.get(i, i),
+                     help="Pick who starts (e.g. a backup when QB1 is out). A QB who isn't the team's "
+                          "established QB1 throws with the backup efficiency factor below.")
+    sb.slider("Backup QB efficiency (× YPA / CPOE)", 0.75, 1.0, step=0.01, key="qb_eff",
+              help="Multiplier on yards per attempt for a non-QB1 starter (catch rate × f^0.4, yards per "
+                   "catch × f^0.6). 0.82–0.88 is typical; 1.0 = no penalty.")
+    sb.slider("Replacement QB share of pass attempts", 0.5, 1.0, step=0.05, key="qb_att_share",
+              help="Fraction of the team's passing credited to an overridden starting QB (e.g. 0.7 if a "
+                   "split or an in-game change is expected).")
+    staged_qbs = st.session_state.get("qb_staged", {})
+    if staged_qbs:
+        sb.caption("QB overrides: " + ", ".join(f"{t} → {labels.get(q, q)}" for t, q in sorted(staged_qbs.items())))
+        sb.button("Clear QB overrides", key="qb_clear", on_click=_clear_qb_picks, width="stretch")
+
+    staged = state.staged_depth_spec(players)
+    if st.session_state.get("depth_applied") is None:      # first render: apply the injury report
+        st.session_state["depth_applied"] = staged
+    pending = staged != st.session_state["depth_applied"]
+    if pending:
+        sb.warning("Overrides changed — re-run the simulations to apply them.")
+    rerun_button(staged, key="rerun_sidebar", primary=pending)
+    applied = st.session_state["depth_applied"]
+    sb.caption(f"Applied: {len(applied['inactive'])} out, {len(applied['reactivate'])} re-activated, "
+               f"{len(applied['starting_qbs'])} QB override(s).")
+    w = st.session_state.get("weather") or {}
+    if st.session_state.get("weather_fetched_at"):
+        windy = sum(1 for x in w.values() if float(x.get("wind_mph") or 0) > ui.HIGH_WIND_MPH)
+        sb.caption(f"Weather (Open-Meteo) for {len(w)} games, {st.session_state['weather_fetched_at'][11:16]} UTC"
+                   + (f" · :red[{windy} with wind > 15 mph]" if windy else ""))
+    else:
+        sb.caption("Weather: domes applied; outdoor forecasts load on Re-run (Open-Meteo, free).")
+
+
+def rerun_button(spec: dict | None = None, key: str = "rerun", primary: bool = True, where=None) -> None:
+    where = where or st.sidebar
+    if spec is None:
+        spec = state.staged_depth_spec(state.cached_depth_players(state.db_version()))
+    where.button(RERUN_LABEL, key=key, type="primary" if primary else "secondary", width="stretch",
+                 on_click=state.rerun_simulations_callback, args=(spec,),
+                 help="Apply the injury / depth overrides and the sliders, clear the cached simulations and "
+                      "re-run every 10,000-trial Monte Carlo (scanner probabilities and Edge % update too).")
 
 
 def live_odds_panel(version: str) -> None:
@@ -107,8 +204,11 @@ def scanner_tab(version: str, settings: state.Settings) -> None:
     c1, c2 = st.columns([3, 1])
     c1.subheader("+EV Market Scanner")
     include_started = c2.toggle("Include started games", value=False, key="scan_started")
+    depth = state.applied_depth_spec()
     priced, diag = state.cached_price_markets(version, settings.sharp_priority(), settings.devig_method,
-                                              settings.n_trials, settings.seed, include_started)
+                                              settings.n_trials, settings.seed, include_started,
+                                              state.depth_json(depth),
+                                              state.weather_json(st.session_state.get("weather")))
     if priced.empty:
         st.info("No priced markets yet. `raw_odds` has no pre-kickoff snapshots for upcoming games — use "
                 "**Load cached odds** (0 credits) or **Pull Live Odds** in the sidebar.")
@@ -124,7 +224,7 @@ def scanner_tab(version: str, settings: state.Settings) -> None:
     with f4:
         positive_only = st.toggle("+EV only", value=True, key="scan_pos")
         alts = st.toggle("Alternates", value=True, key="scan_alts")
-    g1, g2, _ = st.columns([1, 1, 2])
+    g1, g2, g3, _ = st.columns([1, 1, 1, 1])
     max_edge = g1.number_input("Max edge %", min_value=0.5, max_value=100.0, value=state.DEFAULT_MAX_EDGE_PCT,
                                step=0.5, key="scan_max_edge",
                                help="Hide selections whose edge exceeds this cap: edges this large are usually "
@@ -132,17 +232,24 @@ def scanner_tab(version: str, settings: state.Settings) -> None:
     min_games = int(g2.number_input("Min historical games played", min_value=0, max_value=50,
                                     value=state.DEFAULT_MIN_HIST_GAMES, step=1, key="scan_min_games",
                                     help="Player props only: games with >20% snap share before this game. "
-                                         "Game markets are unaffected."))
-    filtered = state.filter_evaluated(ev, positive_only, sel_cats, sel_games, sel_books, alts, max_edge, min_games)
+                                         "Game markets and players you activated by hand (starting-QB "
+                                         "override, re-activated) are unaffected."))
+    min_books = int(g3.number_input("Min books", min_value=1, max_value=20, value=state.DEFAULT_MIN_BOOKS, step=1,
+                                    key="scan_min_books", help="Hide selections quoted by fewer sportsbooks."))
+    filtered = state.filter_evaluated(ev, positive_only, sel_cats, sel_games, sel_books, alts, max_edge, min_games,
+                                      min_books)
     table = state.format_scanner(filtered)
 
     bets = filtered[filtered["is_bet"]]
     capped = int((ev["is_bet"] & (ev["edge_pct"] > max_edge)).sum())
+    manual = ev["manual_depth"].fillna(False).astype(bool) if "manual_depth" in ev else False
     thin = int((ev["is_bet"] & ev["market_key"].str.startswith("player_")
-                & (ev["hist_games"].fillna(0) < min_games)).sum()) if min_games else 0
-    if capped or thin:
+                & (ev["hist_games"].fillna(0) < min_games) & ~manual).sum()) if min_games else 0
+    few = int((ev["is_bet"] & (ev["n_books"].fillna(0) < min_books)).sum())
+    if capped or thin or few:
         st.caption(f"Hidden by filters: {capped} bet(s) above the {max_edge:g}% edge cap, "
-                   f"{thin} prop bet(s) on players with < {min_games} qualifying games.")
+                   f"{thin} prop bet(s) on players with < {min_games} qualifying games, "
+                   f"{few} bet(s) quoted by < {min_books} books.")
     ui.kpi_row([
         ("+EV bets", f"{len(bets):,}", f"{settings.min_edge_pct:.1f} ≤ edge ≤ {max_edge:g} pp and EV > 0"),
         ("Total Kelly stake", f"${bets['kelly_stake'].sum():,.0f}", f"{settings.kelly:.2f}× Kelly on ${settings.bankroll:,.0f}"),
@@ -156,7 +263,9 @@ def scanner_tab(version: str, settings: state.Settings) -> None:
                        mime="text/csv", disabled=table.empty)
     st.markdown("<span class='small-note'>Fair odds are always devigged (sharp book first, consensus fallback); "
                 "one-sided markets (e.g. anytime TD “Yes” only) use an assumed 8% margin. Game-model points "
-                "may move at most ±3 from the market.</span>", unsafe_allow_html=True)
+                "may move at most ±3 from the market. Props of players with < 3 qualifying games are blended "
+                "toward the devigged market line. Inactive players' props are not priced.</span>",
+                unsafe_allow_html=True)
     _scanner_diagnostics(diag)
 
 
@@ -179,34 +288,54 @@ def _scanner_diagnostics(diag: dict) -> None:
 # Tab 2: player sim explorer
 # ======================================================================================
 def explorer_tab(version: str, settings: state.Settings) -> None:
-    st.subheader("Player Sim & Alt-Line Explorer")
+    h1, h2 = st.columns([3, 1], vertical_alignment="bottom")
+    h1.subheader("Player Sim & Alt-Line Explorer")
+    with h2:
+        rerun_button(key="rerun_explorer", primary=False, where=st)
     include_past = st.toggle("Include past games", value=False, key="exp_past")
     games = state.cached_explorer_games(version, include_past)
     if games.empty:
         st.info("No simulatable games (need `player_features` rows). Run the feature builders, "
                 "or enable *Include past games*.")
         return
+    depth = state.depth_json(state.applied_depth_spec())
     c1, c2, c3 = st.columns([2, 2, 1.4])
     gid = c1.selectbox("Game", games["game_id"], key="exp_game",
                        format_func=dict(zip(games["game_id"], games["label"])).get)
+    weather = state.game_weather(version, gid)
+    wjson = state.weather_json(weather)
+    ui.weather_badge(weather)
     try:
-        players = state.cached_players(version, gid)
+        base_sim = state.cached_simulation(version, gid, "{}", settings.n_trials, settings.seed, depth, wjson)
     except ValueError as exc:
         st.warning(str(exc))
         return
-    pool = players[players["active"] & players["position"].isin(["QB", "RB", "WR", "TE", "FB"])].copy()
-    pool["opp"] = pool["target_share"] + pool["carry_share"] + pool["is_starting_qb"].astype(float)
+    players = base_sim.players
+    pool = players[players["position"].isin(["QB", "RB", "WR", "TE", "FB"])].copy()
+    pool["opp"] = (pool["target_share"] + pool["carry_share"] + pool["is_starting_qb"].astype(float)
+                   + pool["active"].astype(float))
     pool = pool.sort_values(["team", "opp"], ascending=[True, False])
-    labels = {r.gsis_id: f"{r.player_name} ({r.position}, {r.team})" for r in pool.itertuples()}
+
+    def label(r) -> str:
+        tag = "" if r.gsis_id in base_sim.stats else (" · backup QB" if r.position == "QB" and not r.is_out
+                                                      else " · inactive")
+        return f"{r.player_name} ({r.position}, {r.team}){tag}"
+    labels = {r.gsis_id: label(r) for r in pool.itertuples()}
     pid = c2.selectbox("Player", pool["gsis_id"], key="exp_player", format_func=labels.get)
     player = pool.set_index("gsis_id").loc[pid].copy()
     player["gsis_id"] = pid
+    _team_adjustment_note(base_sim, str(player["team"]), labels)
+    if pid not in base_sim.stats:
+        why = ("is a backup QB — pick him under **Starting QB / key replacement** in the sidebar"
+               if player["position"] == "QB" else "is on the **Inactive / Out** list — remove him there")
+        st.info(f"{player['player_name']} {why}, then click **{RERUN_LABEL}**.")
+        return
 
     base_ts, base_cs = float(player["target_share"]), float(player["carry_share"])
     base_snap = float(player["snap_share_ewm5"]) if pd.notna(player["snap_share_ewm5"]) else 0.0
     k = f"{gid}_{pid}"
     st.markdown("**Usage overrides** — the simulator rescales teammates so team totals are unchanged.")
-    s1, s2, s3, s4 = st.columns([1, 1, 1, 0.5])
+    s1, s2, s3, s4 = st.columns([1, 1, 1, 0.5], vertical_alignment="bottom")
     ts = s1.slider("Target share", 0.0, 0.6, value=round(base_ts, 3), step=0.005, key=f"ts_{k}",
                    help=f"Projected: {base_ts:.1%}")
     cs = s2.slider("Carry share", 0.0, 0.9, value=round(base_cs, 3), step=0.005, key=f"cs_{k}",
@@ -218,9 +347,8 @@ def explorer_tab(version: str, settings: state.Settings) -> None:
               args=(k, round(base_ts, 3), round(base_cs, 3), round(base_snap, 3)))
     overrides = state.usage_overrides(player, ts, cs, ss if base_snap > 0 else base_snap)
 
-    base_sim = state.cached_simulation(version, gid, "{}", settings.n_trials, settings.seed)
     sim = state.cached_simulation(version, gid, json.dumps(overrides, sort_keys=True), settings.n_trials,
-                                  settings.seed) if overrides else base_sim
+                                  settings.seed, depth, wjson) if overrides else base_sim
     stats = [s for s in state.STAT_ORDER if s in sim.stats.get(pid, {})]
     useful = [s for s in stats if float(np.mean(base_sim.stats[pid][s])) > 0.05] or stats
     stat = c3.selectbox("Stat", useful, key=f"exp_stat_{pid}", format_func=lambda s: state.STAT_LABELS.get(s, s))
@@ -242,6 +370,9 @@ def explorer_tab(version: str, settings: state.Settings) -> None:
                     width="stretch", key="exp_hist")
     if lines.empty:
         st.caption("No sportsbook lines cached for this player/stat — showing model fair odds at a custom line.")
+    if bool(player.get("cold_start", False)):
+        st.caption(f"{name} has < {state.gs.COLD_START_GAMES} qualifying games: usage is blended with a positional "
+                   "prior, and the +EV scanner also blends his prop probabilities toward the market line.")
     custom = st.number_input("Custom line", value=main_line, step=0.5, key=f"exp_line_{pid}_{stat}")
     probs = state.line_probabilities(x, list(lines["line"]) + [custom])
     if not lines.empty:
@@ -264,6 +395,31 @@ def explorer_tab(version: str, settings: state.Settings) -> None:
         st.caption(f"Overrides applied: `{json.dumps(overrides[pid])}`")
 
 
+def _team_adjustment_note(sim, team: str, labels: dict) -> None:
+    """One line on what the applied depth overrides did to this player's team."""
+    adj = sim.adjustments.get(team, {})
+    if not adj:
+        return
+    parts = []
+    qb = adj.get("starting_qb")
+    if qb:
+        parts.append(f"starting QB {labels.get(qb, qb).split(' (')[0]}")
+    if abs(adj.get("qb_efficiency", 1.0) - 1) > 1e-9:
+        parts.append(f"backup-QB efficiency ×{adj['qb_efficiency']:.2f}")
+    if adj.get("missing_starters"):
+        parts.append(f"missing {', '.join(adj['missing_starters'])} (×{adj['missing_starter_factor']:.2f})")
+    if abs(adj.get("qb_attempt_share", 1.0) - 1) > 1e-9:
+        parts.append(f"QB attempt share {adj['qb_attempt_share']:.0%}")
+    if abs(adj.get("pass_efficiency", 1.0) - 1) > 1e-9:
+        parts.append(f"team YPA ×{adj['pass_efficiency']:.2f}")
+    wf = adj.get("weather") or {}
+    w_eff = float(wf.get("wind_pass_efficiency", 1.0)) * float(wf.get("wet_cold", 1.0))
+    if abs(w_eff - 1) > 1e-9 or abs(float(wf.get("pass_rate", 1.0)) - 1) > 1e-9:
+        parts.append(f"weather: pass efficiency ×{w_eff:.2f}, pass rate ×{float(wf.get('pass_rate', 1.0)):.2f}")
+    if parts:
+        st.caption(f"**{team} depth adjustments:** " + " · ".join(parts))
+
+
 def _reset_sliders(k: str, ts: float, cs: float, ss: float) -> None:
     st.session_state[f"ts_{k}"], st.session_state[f"cs_{k}"], st.session_state[f"ss_{k}"] = ts, cs, ss
 
@@ -283,6 +439,9 @@ def shopper_tab(version: str, settings: state.Settings) -> None:
     ev_label = {r.event_id: f"{r.game} · {pd.Timestamp(r.commence_time_utc):%a %b %d %H:%M} UTC"
                 for r in events.itertuples()}
     eid = c1.selectbox("Game", events["event_id"], key="shop_event", format_func=ev_label.get)
+    shop_gid = events.set_index("event_id")["game_id"].get(eid) if "game_id" in events else None
+    if isinstance(shop_gid, str):
+        ui.weather_badge(state.game_weather(version, shop_gid))
     markets = sorted(odds.loc[odds["event_id"] == eid, "market_key"].unique(),
                      key=lambda m: (m.startswith("player_"), "alternate" in m, m))
     mk = c2.selectbox("Market", markets, key="shop_market")

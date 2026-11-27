@@ -6,7 +6,10 @@ Tables written to ``data/nfl_model.duckdb``:
 * ``player_weekly`` weekly player stats; ``player_id`` renamed to ``gsis_id``; ``game_date`` joined from schedules
 * ``snap_counts``  PFR snap counts with ``gsis_id`` (via players.pfr_id) and ``game_date``
 * ``injuries``     weekly injury reports with ``game_id`` / ``game_date`` of that team's game
-* ``rosters``      seasonal rosters (gsis_id, team, position, ...)
+* ``rosters``      seasonal rosters (gsis_id, team, position, status ACT/RES/DEV/CUT, ...); the
+                   current season's snapshot seeds roster-only rows for backups (``player_usage``)
+* ``depth_charts`` skill-position depth charts normalised to (season, team, gsis_id, position,
+                   depth_rank, snapshot_date); the latest snapshot orders backups and starting QBs
 * ``schedules``    games with ``game_date`` DATE
 * ``participation`` players on the field per play (route participation); nflverse publishes it
                    with a lag, so the newest season may be "unavailable" (logged, not a failure)
@@ -44,7 +47,8 @@ DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "nfl_model.duckdb"
 START_SEASON = 2018
 
 SEASONAL_DATASETS: tuple[str, ...] = ("schedules", "pbp", "player_weekly", "snap_counts", "injuries", "rosters",
-                                      "participation")
+                                      "depth_charts", "participation")
+DEPTH_POSITIONS: tuple[str, ...] = ("QB", "RB", "FB", "WR", "TE")
 DATASETS: tuple[str, ...] = ("players",) + SEASONAL_DATASETS
 
 Loader = Callable[..., pl.DataFrame]
@@ -61,6 +65,7 @@ def default_loaders() -> dict[str, Loader]:
         "snap_counts": nfl.load_snap_counts,
         "injuries": nfl.load_injuries,
         "rosters": nfl.load_rosters,
+        "depth_charts": nfl.load_depth_charts,
         "participation": nfl.load_participation,
     }
 
@@ -150,6 +155,38 @@ def clean_injuries(df: pl.DataFrame, schedules: pl.DataFrame | None) -> pl.DataF
 
 def clean_rosters(df: pl.DataFrame) -> pl.DataFrame:
     return df
+
+
+def clean_depth_charts(df: pl.DataFrame, season: int) -> pl.DataFrame:
+    """Normalise both nflverse depth-chart schemas to skill positions only.
+
+    * 2025+ (daily ESPN snapshots): ``dt, team, gsis_id, pos_abb, pos_slot, pos_rank``. WRs are
+      listed per slot (X / Z / slot), so the team-level rank orders by (pos_rank, pos_slot).
+    * up to 2024 (weekly): ``season, week, club_code, gsis_id, position, depth_team``.
+
+    Output: season, week (NULL for daily), snapshot_date, team, gsis_id, player_name, position,
+    depth_rank (1 = starter).
+    """
+    cols = ["season", "week", "snapshot_date", "team", "gsis_id", "player_name", "position", "depth_rank"]
+    if df.is_empty():
+        return pl.DataFrame(schema={c: pl.Utf8 for c in cols})
+    if "dt" in df.columns:
+        d = df.filter(pl.col("pos_abb").is_in(DEPTH_POSITIONS) & pl.col("gsis_id").is_not_null()).with_columns(
+            pl.col("dt").cast(pl.Utf8).str.slice(0, 10).str.to_date("%Y-%m-%d", strict=False).alias("snapshot_date"),
+            pl.col("pos_abb").alias("position"))
+        d = (d.sort(["snapshot_date", "team", "position", "pos_rank", "pos_slot"])
+              .unique(subset=["snapshot_date", "team", "position", "gsis_id"], keep="first", maintain_order=True)
+              .with_columns(pl.int_range(1, pl.len() + 1).over(["snapshot_date", "team", "position"])
+                            .cast(pl.Int32).alias("depth_rank"),
+                            pl.lit(None, dtype=pl.Int32).alias("week")))
+    else:
+        team_col = "club_code" if "club_code" in df.columns else "team"
+        name_col = "full_name" if "full_name" in df.columns else "player_name"
+        d = df.rename({team_col: "team", name_col: "player_name"}) if team_col != "team" or name_col != "player_name" else df
+        d = d.filter(pl.col("position").is_in(DEPTH_POSITIONS) & pl.col("gsis_id").is_not_null()).with_columns(
+            pl.col("depth_team").cast(pl.Int32, strict=False).alias("depth_rank"),
+            pl.lit(None, dtype=pl.Date).alias("snapshot_date"))
+    return d.with_columns(pl.lit(season, dtype=pl.Int32).alias("season")).select(cols)
 
 
 def clean_participation(df: pl.DataFrame, season: int) -> pl.DataFrame:
@@ -328,6 +365,8 @@ def ingest(con: duckdb.DuckDBPyConnection, seasons: Sequence[int], datasets: Seq
                     df = clean_injuries(raw, season_sched)
                 elif dataset == "participation":
                     df = clean_participation(raw, season)
+                elif dataset == "depth_charts":
+                    df = clean_depth_charts(raw, season)
                 else:
                     df = clean_rosters(raw)
                 df = _int_keys(df)

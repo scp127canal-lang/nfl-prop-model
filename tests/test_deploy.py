@@ -144,3 +144,22 @@ def test_export_enforces_size_limit(tmp_path):
     with pytest.raises(RuntimeError, match="MB"):
         mod.export(src, tmp_path / "deploy.duckdb", max_mb=0.001)
     assert not (tmp_path / "deploy.duckdb").exists()
+
+
+def test_export_keeps_latest_depth_chart_and_roster_rows(tmp_path):
+    src = tmp_path / "full.duckdb"
+    con = build_db(two_season_league(), src)
+    con.execute("""CREATE TABLE depth_charts AS SELECT * FROM (VALUES
+        (2025, NULL, DATE '2025-11-20', 'DET', 'DET_QB', 'DET QB', 'QB', 1),
+        (2025, NULL, DATE '2025-11-27', 'DET', 'DET_QB2', 'DET QB2', 'QB', 1),
+        (2025, NULL, DATE '2025-11-27', 'DET', 'DET_QB', 'DET QB', 'QB', 2),
+        (2025, NULL, DATE '2025-11-25', 'GB', 'GB_QB', 'GB QB', 'QB', 1))
+        t(season, week, snapshot_date, team, gsis_id, player_name, position, depth_rank)""")
+    con.close()
+    dst = tmp_path / "deploy.duckdb"
+    counts = _load_export_module().export(src, dst, max_mb=40)
+    assert counts["depth_charts"] == 3
+    with duckdb.connect(str(dst), read_only=True) as b:
+        rows = b.execute("SELECT team, gsis_id, depth_rank FROM depth_charts ORDER BY team, depth_rank").fetchall()
+        assert rows == [("DET", "DET_QB2", 1), ("DET", "DET_QB", 2), ("GB", "GB_QB", 1)]
+        assert "roster_only" in {r[0] for r in b.execute("DESCRIBE player_features").fetchall()}

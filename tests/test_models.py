@@ -499,3 +499,105 @@ def test_load_players_blends_only_thin_history(con):
         [1, 0.03, 0.12, 0.0, 0.0]
     blended = gs.blend_cold_start(rookie)
     assert blended["target_share"].iloc[0] == pytest.approx(0.03 / 3 + 0.12 * 2 / 3)   # 0.09: 3x raw EWMA
+
+
+# ======================================================================================
+# Depth-chart mode: inactive list, QB replacement, missing-starter penalty
+# ======================================================================================
+from tests.test_features import with_roster  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def depth_con(tmp_path_factory):
+    c = build_db(enrich(with_roster(LEAGUE)), tmp_path_factory.mktemp("d") / "depth.duckdb")
+    yield c
+    c.close()
+
+
+def _game_of(con, team):
+    return con.execute("SELECT game_id FROM schedules WHERE week = ? AND (home_team = ? OR away_team = ?)",
+                       [UPCOMING_WEEK, team, team]).fetchall()[0][0]
+
+
+def _pl(res, pid, col):
+    return float(res.players.set_index("gsis_id").at[pid, col])
+
+
+def test_roster_only_backups_load_without_diluting_starters(depth_con, con):
+    gid = _game_of(depth_con, "DET")
+    pl = gs.load_players(depth_con, gid).set_index("gsis_id")
+    assert {"DET_QB2", "DET_WR4"} <= set(pl.index)
+    assert not pl.at["DET_QB2", "active"] and pl.at["DET_QB", "is_starting_qb"]
+    assert pl.at["DET_WR4", "active"] and 0 < pl.at["DET_WR4", "target_share"] < 0.05
+    plain = gs.load_players(con, gid).set_index("gsis_id")              # same league without the roster rows
+    for pid in ("DET_WR1", "DET_TE1", "DET_RB1"):
+        assert pl.at[pid, "target_share"] == pytest.approx(plain.at[pid, "target_share"], rel=0.05)
+    det = pl[pl.team == "DET"]
+    assert det.loc[det.active, "target_share"].sum() <= gs.MAX_TEAM_TARGET_SHARE + 1e-9
+
+
+def test_depth_mode_without_changes_keeps_det_and_penalizes_missing_ir_starter(depth_con):
+    det = gs.simulate_game(_game_of(depth_con, "DET"), con=depth_con, seed=5, n_trials=4000, depth={})
+    assert det.adjustments["DET"]["pass_efficiency"] == 1.0 and det.adjustments["DET"]["starting_qb"] == "DET_QB"
+    gb = gs.simulate_game(_game_of(depth_con, "GB"), con=depth_con, seed=5, n_trials=4000, depth={})
+    adj = gb.adjustments["GB"]
+    assert adj["missing_starters"] == ["GB WR2"]                          # on IR via the roster snapshot
+    assert adj["missing_starter_factor"] < 1.0
+
+
+def test_qb_out_promotes_backup_with_efficiency_factor(depth_con):
+    gid = _game_of(depth_con, "DET")
+    base = gs.simulate_game(gid, con=depth_con, seed=5, n_trials=4000, depth={})
+    out = gs.simulate_game(gid, con=depth_con, seed=5, n_trials=4000, depth={"inactive": ["DET_QB"]})
+    assert "DET_QB" not in out.stats and "pass_yds" in out.stats["DET_QB2"]
+    adj = out.adjustments["DET"]
+    assert adj["starting_qb"] == "DET_QB2" and adj["qb_efficiency"] == gs.BACKUP_QB_EFFICIENCY
+    f = gs.BACKUP_QB_EFFICIENCY
+    assert _pl(out, "DET_WR1", "ypr") == pytest.approx(_pl(base, "DET_WR1", "ypr") * f ** 0.6, rel=1e-6)
+    assert _pl(out, "DET_WR1", "catch_rate") == pytest.approx(_pl(base, "DET_WR1", "catch_rate") * f ** 0.4, rel=1e-6)
+    ypa = lambda r, q: r.get(q, "pass_yds").mean() / r.get(q, "pass_attempts").mean()  # noqa: E731
+    assert ypa(out, "DET_QB2") == pytest.approx(ypa(base, "DET_QB") * f, rel=0.06)
+
+
+def test_explicit_starting_qb_and_attempt_share(depth_con):
+    gid = _game_of(depth_con, "DET")
+    base = gs.simulate_game(gid, con=depth_con, seed=5, n_trials=4000, depth={})
+    pick = gs.simulate_game(gid, con=depth_con, seed=5, n_trials=4000,
+                            depth={"starting_qbs": {"DET": "DET_QB2"}, "qb_efficiency": 0.82, "qb_attempt_share": 0.6})
+    assert "DET_QB" not in pick.stats and pick.adjustments["DET"]["qb_efficiency"] == 0.82
+    assert pick.get("DET_QB2", "pass_attempts").mean() == pytest.approx(
+        0.6 * base.get("DET_QB", "pass_attempts").mean(), rel=0.05)
+    assert pick.get("DET_QB2", "rush_attempts").mean() > 0               # inherits a QB carry share
+    with pytest.raises(KeyError):
+        gs.apply_usage_overrides(gs.load_players(depth_con, gid), {"DET": {"starting_qb": "DET_WR1"}},
+                                 ["DET", "MIN"])
+
+
+def test_inactive_wr1_redistributes_within_offense_and_penalizes_qb(depth_con):
+    gid = _game_of(depth_con, "DET")
+    base = gs.simulate_game(gid, con=depth_con, seed=5, n_trials=4000, depth={})
+    out = gs.simulate_game(gid, con=depth_con, seed=5, n_trials=4000, depth={"inactive": ["DET_WR1"]})
+    assert "DET_WR1" not in out.stats
+    pl0 = base.players.set_index("gsis_id")
+    pl1 = out.players.set_index("gsis_id")
+    det = pl1.index[(pl1.team == "DET") & pl1.active]
+    assert pl1.loc[det, "target_share"].sum() == pytest.approx(pl0.loc[pl0.active & (pl0.team == "DET"), "target_share"].sum())
+    for mate in ("DET_WR2", "DET_WR3", "DET_TE1", "DET_RB1"):
+        assert pl1.at[mate, "target_share"] > pl0.at[mate, "target_share"]
+    gain = pl1.loc[["DET_WR2", "DET_WR3"], "target_share"].sum() - pl0.loc[["DET_WR2", "DET_WR3"], "target_share"].sum()
+    assert gain > pl1.at["DET_TE1", "target_share"] - pl0.at["DET_TE1", "target_share"]   # same group first
+    assert pl1.at["DET_QB", "carry_share"] == pytest.approx(pl0.at["DET_QB", "carry_share"], rel=0.05)
+    share = float(pl0.loc["DET_WR1", ["target_share_ewm3", "target_share_ewm5"]].mean())
+    expect = 1 - gs.MISSING_STARTER_PENALTY * share / gs.MISSING_STARTER_UNIT
+    assert out.adjustments["DET"]["missing_starter_factor"] == pytest.approx(expect)
+    assert out.get("DET_QB", "pass_yds").mean() < base.get("DET_QB", "pass_yds").mean()
+
+
+def test_reactivating_listed_player_and_spec_scoping(depth_con):
+    gid = _game_of(depth_con, "GB")
+    res = gs.simulate_game(gid, con=depth_con, seed=5, n_trials=2000,
+                           depth={"reactivate": ["GB_WR2"], "inactive": ["DET_WR1"]})   # DET not in this game
+    assert "GB_WR2" in res.stats and _pl(res, "GB_WR2", "target_share") > 0.05
+    assert res.adjustments["GB"]["missing_starter_factor"] == 1.0
+    ov = gs.depth_overrides(gs.load_players(depth_con, gid), inactive=["DET_WR1", "GB_WR1"])
+    assert "DET_WR1" not in ov and ov["GB_WR1"] == {"active": False}

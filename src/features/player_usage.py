@@ -28,6 +28,18 @@ tier (rotational / starter / full-time). The league rates are cumulative over ga
 earlier dates and shrunk toward fixed defaults, so the prior is point-in-time too. The simulator
 blends own usage with this prior (``game_sim.load_players``).
 
+Full roster / depth chart for upcoming games
+--------------------------------------------
+The eligible pool only holds players with recent snaps, so a backup QB or a RB2/WR3/TE2 who has
+barely played would never reach the simulator or the UI selectors. For games not yet played,
+every ``ACT`` skill player on the current season's ``rosters`` snapshot who is missing from the
+pool gets a **roster-only** row (``roster_only = True``, ``eligible = True``). Its usage prior
+comes from a conservative depth-chart snap share (``DEPTH_SNAP_PRIOR``; latest ``depth_charts``
+snapshot), and the simulator caps these rows to the team's unassigned share so they never dilute
+established players. The roster snapshot also marks upcoming rows of players on reserve / IR
+(``RES``) or the practice squad (``DEV``) as out, and drops rows of players no longer on the team
+(cut / traded). Played games are never touched, so historical training rows stay point-in-time.
+
 RYOE uses an expected-yards baseline per (down, distance, field-position) bucket built only from
 carries on earlier dates, shrunk toward the prior league mean.
 
@@ -76,6 +88,14 @@ USAGE_PRIOR_DEFAULTS = {
     "QB": ((0.01, 0.20), (0.002, 0.13), (0.001, 0.12)),
 }
 SKILL_POSITIONS = ("QB", "RB", "FB", "WR", "TE")
+# Expected snap share of a roster-only player by depth-chart rank (index 0 = starter; deeper
+# ranks use the last value). Backup QBs get 0: they only play via a starting-QB override.
+DEPTH_SNAP_PRIOR = {"QB": (0.97, 0.0), "RB": (0.55, 0.30, 0.12), "FB": (0.20, 0.08),
+                    "WR": (0.85, 0.75, 0.55, 0.25, 0.10), "TE": (0.75, 0.30, 0.12)}
+NO_DEPTH_SNAP_PRIOR = {"QB": 0.0, "RB": 0.12, "FB": 0.08, "WR": 0.10, "TE": 0.12}
+ROSTER_OUT_STATUSES = {"RES": "IR", "DEV": "Practice squad", "INA": "Inactive"}   # on the team, not playing
+ROSTER_RECENT_DAYS = 70        # roster rows of players who played for the team this recently are regular rows
+ROSTER_GONE_STATUSES = ["CUT", "RET", "TRD", "TRC", "EXE", "NOT_ON_ROSTER"]
 POSITION_GROUP = {"QB": "QB", "RB": "RB", "FB": "RB", "WR": "WR", "TE": "TE"}
 
 # Per-game metrics averaged directly with EWMA
@@ -338,7 +358,14 @@ def attach_usage_prior(panel: pd.DataFrame, stats: pd.DataFrame) -> pd.DataFrame
     p = panel.copy()
     last = p["last_snap_share"].astype(float)
     ewm3 = p["snap_share_ewm3"].astype(float).fillna(last)
-    p["snap_share_expected"] = (RECENT_SNAP_WEIGHT * last + (1 - RECENT_SNAP_WEIGHT) * ewm3).fillna(0.0)
+    own = RECENT_SNAP_WEIGHT * last + (1 - RECENT_SNAP_WEIGHT) * ewm3
+    p["snap_share_expected"] = own.fillna(0.0)
+    if "roster_only" in p:
+        ro = p["roster_only"].fillna(False).astype(bool).to_numpy()
+        dp = depth_snap_prior(p["position"], p.get("depth_rank")).to_numpy()
+        # roster-only: depth-chart prior, averaged with stale own history when there is any
+        mixed = np.where(own.notna(), 0.5 * own.fillna(0.0).to_numpy() + 0.5 * dp, dp)
+        p["snap_share_expected"] = np.where(ro, mixed, p["snap_share_expected"].to_numpy())
     p["usage_tier"] = snap_tier(p["snap_share_expected"])
     rates = positional_usage_rates(stats)
     rates["rate_date"] = pd.to_datetime(rates["rate_date"]).astype("datetime64[ns]")
@@ -356,6 +383,128 @@ def attach_usage_prior(panel: pd.DataFrame, stats: pd.DataFrame) -> pd.DataFrame
     p["carry_share_prior"] = p["pos_carry_per_snap"] * p["snap_share_expected"]
     p["cold_start"] = p["qual_games"] < COLD_START_GAMES
     return p.drop(columns=["_row"])
+
+
+def depth_snap_prior(position: pd.Series, depth_rank: pd.Series | None) -> pd.Series:
+    """Conservative expected snap share from the depth chart (``NO_DEPTH_SNAP_PRIOR`` if unranked)."""
+    ranks = depth_rank if depth_rank is not None else pd.Series(np.nan, index=position.index)
+    out = []
+    for pos, r in zip(position, pd.to_numeric(ranks, errors="coerce")):
+        if pd.isna(r) or pos not in DEPTH_SNAP_PRIOR:
+            out.append(NO_DEPTH_SNAP_PRIOR.get(pos, 0.08))
+        else:
+            tiers = DEPTH_SNAP_PRIOR[pos]
+            out.append(tiers[min(max(int(r), 1), len(tiers)) - 1])
+    return pd.Series(out, index=position.index, dtype=float)
+
+
+# --------------------------------------------------------------------------------------
+# Current roster / depth chart (upcoming games only)
+# --------------------------------------------------------------------------------------
+def unplayed_games(con: duckdb.DuckDBPyConnection) -> set[str]:
+    """Games with no result yet: NULL score, or (schedules without scores) no pbp rows."""
+    cols = {r[0] for r in con.execute("DESCRIBE schedules").fetchall()}
+    if "home_score" in cols:
+        q = "SELECT game_id FROM schedules WHERE home_score IS NULL"
+    elif _table_exists(con, "pbp"):
+        q = "SELECT game_id FROM schedules WHERE game_id NOT IN (SELECT DISTINCT game_id FROM pbp)"
+    else:
+        q = "SELECT game_id FROM schedules"
+    return {r[0] for r in con.execute(q).fetchall()}
+
+
+ROSTER_COLUMNS = ["season", "gsis_id", "roster_team", "roster_position", "roster_status", "roster_name"]
+
+
+def current_rosters(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Latest roster entry per (season, gsis_id): team, position, status (NULL = unknown, e.g. a
+    rosters table without a ``status`` column; such rows add no roster context)."""
+    if not _table_exists(con, "rosters"):
+        return pd.DataFrame(columns=ROSTER_COLUMNS)
+    cols = {r[0] for r in con.execute("DESCRIBE rosters").fetchall()}
+    status = "status" if "status" in cols else "NULL"
+    week = "week" if "week" in cols else "0"
+    name = "full_name" if "full_name" in cols else "NULL"
+    df = con.execute(f"""
+        SELECT CAST(season AS INT) AS season, gsis_id, team AS roster_team, position AS roster_position,
+               CAST({status} AS VARCHAR) AS roster_status, CAST({name} AS VARCHAR) AS roster_name
+        FROM rosters WHERE gsis_id IS NOT NULL
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY season, gsis_id ORDER BY {week} DESC NULLS LAST) = 1""").df()
+    return df[ROSTER_COLUMNS]
+
+
+def latest_depth_chart(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Depth rank per (season, team, gsis_id) from the latest snapshot (or week) of each season/team."""
+    if not _table_exists(con, "depth_charts"):
+        return pd.DataFrame(columns=["season", "team", "gsis_id", "depth_rank"])
+    return con.execute("""
+        WITH d AS (SELECT *, COALESCE(CAST(snapshot_date AS VARCHAR), LPAD(CAST(week AS VARCHAR), 2, '0')) AS k
+                   FROM depth_charts WHERE gsis_id IS NOT NULL),
+             m AS (SELECT season, team, MAX(k) AS k FROM d GROUP BY ALL)
+        SELECT CAST(d.season AS INT) AS season, d.team, d.gsis_id, MIN(d.depth_rank) AS depth_rank
+        FROM d JOIN m USING (season, team, k) GROUP BY ALL""").df()
+
+
+def add_roster_rows(panel: pd.DataFrame, sched: pd.DataFrame, rosters: pd.DataFrame,
+                    upcoming: set[str]) -> pd.DataFrame:
+    """Roster-only rows: every ACT skill player of the team's current roster missing from an
+    upcoming game's pool (``eligible = True`` so the simulator and the UI see him)."""
+    panel = panel.assign(roster_only=False)
+    if rosters.empty or not upcoming:
+        return panel
+    act = rosters[(rosters["roster_status"] == "ACT") & rosters["roster_position"].isin(SKILL_POSITIONS)]
+    games = sched[sched["game_id"].isin(upcoming)][["game_id", "team", "season", "week", "game_date", "opponent"]]
+    cand = games.merge(act[["season", "gsis_id", "roster_team"]].rename(columns={"roster_team": "team"}),
+                       on=["season", "team"], how="inner")
+    have = set(zip(panel["gsis_id"], panel["game_id"]))
+    new = cand[[(g, gm) not in have for g, gm in zip(cand["gsis_id"], cand["game_id"])]]
+    if new.empty:
+        return panel
+    new = new.assign(eligible=True, roster_only=True)
+    logger.info("Added %d roster-only rows (%d players) for upcoming games", len(new), new["gsis_id"].nunique())
+    return pd.concat([panel, new], ignore_index=True)
+
+
+def promote_recent_roster_rows(panel: pd.DataFrame, days: int = ROSTER_RECENT_DAYS) -> pd.DataFrame:
+    """A roster row for a player who recently played for this team (e.g. a starter in a game just
+    beyond the eligibility lookback) is a regular row, not a no-history backup."""
+    p = panel.copy()
+    recent = (p["last_game_team"] == p["team"]) & (p["days_since_last_game"] <= days)
+    p["roster_only"] = p["roster_only"].fillna(False).astype(bool) & ~recent.fillna(False)
+    return p
+
+
+def attach_roster_context(panel: pd.DataFrame, rosters: pd.DataFrame, depth: pd.DataFrame,
+                          upcoming: set[str]) -> pd.DataFrame:
+    """``roster_status`` / ``depth_rank`` for upcoming rows (NULL for played games)."""
+    p = panel.reset_index(drop=True).copy()
+    p["roster_status"] = pd.Series([None] * len(p), dtype=object)
+    p["depth_rank"] = np.nan
+    up = p["game_id"].isin(upcoming).to_numpy()
+    if not up.any():
+        return p
+    sub = p.loc[up, ["season", "gsis_id", "team"]]
+    if not rosters.empty:
+        r = sub.merge(rosters, on=["season", "gsis_id"], how="left")
+        status = np.where(r["roster_status"].isna(), None,
+                          np.where(r["roster_team"] != r["team"], "NOT_ON_ROSTER", r["roster_status"]))
+        p.loc[up, "roster_status"] = status
+    if not depth.empty:
+        d = sub.merge(depth, on=["season", "team", "gsis_id"], how="left")
+        p.loc[up, "depth_rank"] = d["depth_rank"].to_numpy(float)
+    return p
+
+
+def apply_roster_status(panel: pd.DataFrame) -> pd.DataFrame:
+    """Players on IR / practice squad / gone from the team are out for upcoming games."""
+    p = panel.copy()
+    rs = p["roster_status"]
+    labels = rs.map(ROSTER_OUT_STATUSES)
+    labels = labels.where(~rs.isin(ROSTER_GONE_STATUSES), "Not on roster")
+    hit = labels.notna() & ~p["injury_status"].isin(OUT_STATUSES)
+    p.loc[hit, "injury_status"] = labels[hit]
+    p["is_out"] = p["is_out"].fillna(False).astype(bool) | labels.notna()
+    return p
 
 
 # --------------------------------------------------------------------------------------
@@ -410,10 +559,16 @@ def attach_injuries(con: duckdb.DuckDBPyConnection, panel: pd.DataFrame) -> pd.D
     return panel
 
 
-def player_meta(stats: pd.DataFrame, con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
-    """Latest known position/name per player (positions rarely change; used for upcoming rows)."""
-    latest = (stats.sort_values("game_date").groupby("gsis_id")[["position", "player_name"]].last())
-    return latest.reset_index()
+def player_meta(stats: pd.DataFrame, con: duckdb.DuckDBPyConnection,
+                rosters: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Latest known position/name per player (positions rarely change; used for upcoming rows).
+    Players with no stats yet (roster-only backups) take them from the roster."""
+    latest = (stats.sort_values("game_date").groupby("gsis_id")[["position", "player_name"]].last()).reset_index()
+    if rosters is not None and not rosters.empty:
+        r = (rosters.sort_values("season").groupby("gsis_id")[["roster_position", "roster_name"]].last()
+             .reset_index().rename(columns={"roster_position": "position", "roster_name": "player_name"}))
+        latest = pd.concat([latest, r[~r["gsis_id"].isin(latest["gsis_id"])]], ignore_index=True)
+    return latest
 
 
 # --------------------------------------------------------------------------------------
@@ -489,16 +644,24 @@ def compute_player_features(con: duckdb.DuckDBPyConnection, spans: Sequence[int]
     stats = compute_player_game_stats(con)
     sched = team_schedule(con)
     state = ewma_state(stats, spans)
+    upcoming = unplayed_games(con)
+    rosters = current_rosters(con)
     panel = build_panel(stats, sched)
-    panel = panel.merge(player_meta(stats, con), on="gsis_id", how="left")
+    panel = add_roster_rows(panel, sched, rosters, upcoming)
+    panel = attach_roster_context(panel, rosters, latest_depth_chart(con), upcoming)
+    panel = panel.merge(player_meta(stats, con, rosters), on="gsis_id", how="left")
+    panel = panel[panel["position"].isin(SKILL_POSITIONS)].copy()
     panel["position_group"] = panel["position"].map(POSITION_GROUP)
     panel = attach_state(panel, state)
+    panel = promote_recent_roster_rows(panel)
     panel = attach_usage_prior(panel, stats)
     panel = attach_injuries(con, panel)
+    panel = apply_roster_status(panel)
     panel = apply_injury_spillover(panel, spans)
+    panel = panel[~panel["roster_status"].isin(ROSTER_GONE_STATUSES)]   # cut / traded: no longer on the team
     lead = ["season", "week", "game_id", "game_date", "team", "opponent", "gsis_id", "player_name", "position",
-            "position_group", "eligible", "prior_games", "qual_games", "cold_start", "days_since_last_game",
-            "last_game_team",
+            "position_group", "eligible", "roster_only", "roster_status", "depth_rank", "prior_games", "qual_games",
+            "cold_start", "days_since_last_game", "last_game_team",
             "injury_status", "is_out", "is_top2", "team_top2_out"]
     rest = sorted(c for c in panel.columns if c not in lead)
     return panel[lead + rest].sort_values(["game_date", "game_id", "team", "gsis_id"]).reset_index(drop=True)
